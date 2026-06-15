@@ -8,6 +8,7 @@ use axum::{
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 use engine::Aledb;
+use engine::Query;
 
 #[derive(Clone)]
 struct AppState {
@@ -26,6 +27,7 @@ async fn main() {
         .route("/update/:id", post(update_doc))
         .route("/save", post(save))
         .route("/load", post(load))
+        .route("/query", post(query)) 
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
@@ -76,13 +78,34 @@ async fn save(State(state): State<AppState>, Json(payload): Json<Value>) -> Json
 }
 
 async fn load(State(state): State<AppState>, Json(payload): Json<Value>) -> Json<Value> {
-    let path = payload["path"]
-        .as_str()
-        .unwrap_or("dboh.json");
+    let path = payload["path"].as_str().unwrap_or("dboh.json");
     let mut db = state.db.lock().unwrap();
 
     match db.load(path) {
         Ok(_) => Json(json!({ "status": "loaded", "file": path })),
         Err(e) => Json(json!({ "error": e })),
+    }
+}
+
+//   {
+//     "select": ["nome", "età"],
+//     "where": {
+//       "città":  "Milano",               
+//       "età":    { ">": 25 },
+//       "score":  { ">=": 9.5 }
+//      }
+//   }
+
+async fn query(State(state): State<AppState>, Json(payload): Json<Value>) -> Json<Value> {
+    match Query::from_json(&payload) {
+        Err(e) => Json(json!({ "error": e })),
+        Ok(q)  => {
+            let db = state.db.lock().unwrap();
+            let results = db.query(&q);
+            Json(json!({
+                "count":   results.len(),
+                "results": results,
+            }))
+        }
     }
 }
