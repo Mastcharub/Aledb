@@ -1,18 +1,88 @@
-mod db;
+mod engine;
 
-use db::Aledb;
-use serde_json::json;
+use axum::{
+    extract::{Path, State},
+    routing::{get, post},
+    Json, Router,
+};
+use serde_json::{json, Value};
+use std::sync::{Arc, Mutex};
+use engine::Aledb;
 
-fn main() {
-    let mut database = Aledb::new(); 
-    /*
-    let doc1 = json!({"name": "Mario", "age": 32});
-    let doc2 = json!({"name": "Sandro", "age": 67});
-    let docs = vec![doc1, doc2];
-    database.insert_many(&docs);
-    database.save("dboh.json");
-    */
-    database.load("dboh.json");
-    database.insert(json!({"name": "Alessandro", "age": 17}));
-    database.save("dboh.json");
+#[derive(Clone)]
+struct AppState {
+    db: Arc<Mutex<Aledb>>,
+}
+
+#[tokio::main]
+async fn main() {
+    let state = AppState {
+        db: Arc::new(Mutex::new(Aledb::new())),
+    };
+
+    let app = Router::new()
+        .route("/insert", post(insert))
+        .route("/get/:id", get(get_doc))
+        .route("/update/:id", post(update_doc))
+        .route("/save", post(save))
+        .route("/load", post(load))
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+
+    println!("Server running on http://localhost:3000");
+
+    axum::serve(listener, app).await.unwrap();
+}
+
+async fn insert(State(state): State<AppState>, Json(doc): Json<Value>) -> Json<Value> {
+    let mut db = state.db.lock().unwrap();
+
+    match db.insert(doc) {
+        Ok(id) => Json(json!({ "id": id })),
+        Err(e) => Json(json!({ "error": e })),
+    }
+}
+
+async fn get_doc(State(state): State<AppState>, Path(id): Path<String>) -> Json<Value> {
+    let db = state.db.lock().unwrap();
+
+    match db.get_id(&id) {
+        Some(doc) => Json(doc),
+        None => Json(json!({ "error": "not found" })),
+    }
+}
+
+async fn update_doc(State(state): State<AppState>, Path(id): Path<String>, Json(patch): Json<Value>) -> Json<Value> {
+    let mut db = state.db.lock().unwrap();
+    db.update(&id, patch);
+
+    Json(json!({ "status": "ok" }))
+}
+
+async fn save(State(state): State<AppState>, Json(payload): Json<Value>) -> Json<Value> {
+    let path = payload["path"]
+        .as_str()
+        .unwrap_or("dboh.json");
+    let db = state.db.lock().unwrap();
+
+    match db.save(path) {
+        Ok(_) => Json(json!({
+            "status": "saved",
+            "file": path
+        })),
+        Err(e) => Json(json!({ "error": e })),
+    }
+}
+
+async fn load(State(state): State<AppState>, Json(payload): Json<Value>) -> Json<Value> {
+    let path = payload["path"]
+        .as_str()
+        .unwrap_or("dboh.json");
+    let mut db = state.db.lock().unwrap();
+
+    match db.load(path) {
+        Ok(_) => Json(json!({ "status": "loaded", "file": path })),
+        Err(e) => Json(json!({ "error": e })),
+    }
 }
