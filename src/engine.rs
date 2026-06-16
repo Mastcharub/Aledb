@@ -19,28 +19,32 @@ pub struct Query {
 
 impl Query {
     pub fn from_json(raw: &Value) -> Result<Self, String> {
-        // --- SELECT ---
         let select = match raw.get("select") {
             Some(Value::Array(arr)) => {
-                let fields: Result<Vec<String>, _> = arr.iter().map(|v| {
-                        v.as_str().map(|s| s.to_string()).ok_or("I campi in 'select' devono essere stringhe")
-                    }).collect();
+                let fields: Result<Vec<String>, _> = arr
+                    .iter()
+                    .map(|v| {
+                        v.as_str()
+                            .map(|s| s.to_string())
+                            .ok_or("I campi in 'select' devono essere stringhe")
+                    })
+                    .collect();
                 Some(fields?)
             }
             Some(_) => return Err("'select' deve essere un array di stringhe".to_string()),
             None => None,
         };
- 
-        // --- WHERE ---
+
         let mut filters = Vec::new();
- 
+
         if let Some(Value::Object(where_map)) = raw.get("where") {
             for (field, condition) in where_map {
                 let predicate = if condition.is_object() {
                     let obj = condition.as_object().unwrap();
                     if obj.len() != 1 {
                         return Err(format!(
-                            "Il campo '{}' deve avere esattamente un operatore", field
+                            "Il campo '{}' deve avere esattamente un operatore",
+                            field
                         ));
                     }
                     let (op, val) = obj.iter().next().unwrap();
@@ -50,31 +54,42 @@ impl Query {
                         ">=" | "gte" => Predicate::Gte(val.clone()),
                         "<"  | "lt"  => Predicate::Lt(val.clone()),
                         "<=" | "lte" => Predicate::Lte(val.clone()),
-                        other => {
-                            return Err(format!("Operatore non supportato: '{}'", other))
-                        }
+                        other => return Err(format!("Operatore non supportato: '{}'", other)),
                     }
                 } else {
                     Predicate::Eq(condition.clone())
                 };
- 
+
                 filters.push((field.clone(), predicate));
             }
         }
- 
-        Ok(Query {select, filters})
+
+        Ok(Query { select, filters })
     }
 }
 
-#[derive(Default)]
+type Index = HashMap<String, HashMap<String, Vec<String>>>;
+
+fn value_key(v: &Value) -> String {
+    v.to_string()
+}
+
 pub struct Aledb {
-    data: HashMap<String, Value>,
+    data:  HashMap<String, Value>,
+    index: Index,
+}
+
+impl Default for Aledb {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Aledb {
     pub fn new() -> Self {
         Self {
-            data: HashMap::new(),
+            data:  HashMap::new(),
+            index: HashMap::new(),
         }
     }
 
@@ -86,8 +101,9 @@ impl Aledb {
         }
 
         doc["id"] = Value::String(id.clone());
-        self.data.insert(id.clone(), doc);
+        self.index_doc(&id, &doc);
 
+        self.data.insert(id.clone(), doc);
         Ok(id)
     }
 
@@ -96,12 +112,20 @@ impl Aledb {
     }
 
     pub fn update(&mut self, id: &str, patch: Value) {
+        if let Some(old_doc) = self.data.get(id).cloned() {
+            self.deindex_doc(id, &old_doc);
+        }
+
         if let Some(existing) = self.data.get_mut(id) {
             if let (Value::Object(e), Value::Object(p)) = (existing, patch) {
                 for (k, v) in p {
                     e.insert(k, v);
                 }
             }
+        }
+
+        if let Some(updated_doc) = self.data.get(id).cloned() {
+            self.index_doc(id, &updated_doc);
         }
     }
 
@@ -115,50 +139,118 @@ impl Aledb {
     pub fn load(&mut self, path: &str) -> Result<(), String> {
         let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
         let docs: Vec<Value> = serde_json::from_str(&content).map_err(|e| e.to_string())?;
-        
+
         for doc in docs {
             let id = doc["id"].as_str().ok_or("Missing id")?.to_string();
+            self.index_doc(&id, &doc);
             self.data.insert(id, doc);
         }
 
         Ok(())
     }
 
-
     pub fn query(&self, q: &Query) -> Vec<Value> {
-        self.data
-            .values()
-            .filter(|doc| Self::matches(doc, &q.filters))
+        let (indexed_eq, rest): (Vec<_>, Vec<_>) =
+            q.filters.iter().partition(|(field, pred)| {
+                matches!(pred, Predicate::Eq(_)) && self.index.contains_key(field.as_str())
+            });
+
+        if indexed_eq.is_empty() {
+            return self.full_scan(&q.filters, &q.select);
+        }
+
+        let best = indexed_eq.iter().min_by_key(|(field, pred)| {
+            if let Predicate::Eq(val) = pred {
+                self.index
+                    .get(field.as_str())
+                    .and_then(|m| m.get(&value_key(val)))
+                    .map(|ids| ids.len())
+                    .unwrap_or(0)
+            } else {
+                usize::MAX
+            }
+        });
+
+        let (best_field, best_pred) = best.unwrap();
+        let Predicate::Eq(best_val) = best_pred else { unreachable!() };
+
+        let candidates: Vec<&Value> = self
+            .index
+            .get(best_field.as_str())
+            .and_then(|m| m.get(&value_key(best_val)))
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(|id| self.data.get(id))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let remaining: Vec<(String, Predicate)> = rest
+            .iter()
+            .chain(indexed_eq.iter().filter(|(f, _)| f != best_field))
+            .map(|(f, p)| (f.clone(), match p {
+                Predicate::Eq(v)  => Predicate::Eq(v.clone()),
+                Predicate::Gt(v)  => Predicate::Gt(v.clone()),
+                Predicate::Gte(v) => Predicate::Gte(v.clone()),
+                Predicate::Lt(v)  => Predicate::Lt(v.clone()),
+                Predicate::Lte(v) => Predicate::Lte(v.clone()),
+            }))
+            .collect();
+
+        candidates
+            .into_iter()
+            .filter(|doc| Self::matches(doc, &remaining))
             .map(|doc| Self::project(doc, &q.select))
             .collect()
     }
 
-    /// Restituisce true se il documento soddisfa tutti i predicati.
+    fn full_scan(&self, filters: &[(String, Predicate)], select: &Option<Vec<String>>) -> Vec<Value> {
+        self.data
+            .values()
+            .filter(|doc| Self::matches(doc, filters))
+            .map(|doc| Self::project(doc, select))
+            .collect()
+    }
+
+    fn index_doc(&mut self, id: &str, doc: &Value) {
+        if let Some(obj) = doc.as_object() {
+            for (field, val) in obj {
+                self.index
+                    .entry(field.clone())
+                    .or_default()
+                    .entry(value_key(val))
+                    .or_default()
+                    .push(id.to_string());
+            }
+        }
+    }
+
+    fn deindex_doc(&mut self, id: &str, doc: &Value) {
+        if let Some(obj) = doc.as_object() {
+            for (field, val) in obj {
+                if let Some(field_map) = self.index.get_mut(field) {
+                    if let Some(ids) = field_map.get_mut(&value_key(val)) {
+                        ids.retain(|x| x != id);
+                    }
+                }
+            }
+        }
+    }
+
     fn matches(doc: &Value, filters: &[(String, Predicate)]) -> bool {
         filters.iter().all(|(field, pred)| {
-            let Some(field_val) = doc.get(field) else {
-                return false;
-            };
+            let Some(field_val) = doc.get(field) else { return false };
             Self::eval(field_val, pred)
         })
     }
- 
+
     fn eval(val: &Value, pred: &Predicate) -> bool {
         match pred {
             Predicate::Eq(expected) => val == expected,
- 
-            Predicate::Gt(threshold) => {
-                matches!((val.as_f64(), threshold.as_f64()), (Some(a), Some(b)) if a > b)
-            }
-            Predicate::Gte(threshold) => {
-                matches!((val.as_f64(), threshold.as_f64()), (Some(a), Some(b)) if a >= b)
-            }
-            Predicate::Lt(threshold) => {
-                matches!((val.as_f64(), threshold.as_f64()), (Some(a), Some(b)) if a < b)
-            }
-            Predicate::Lte(threshold) => {
-                matches!((val.as_f64(), threshold.as_f64()), (Some(a), Some(b)) if a <= b)
-            }
+            Predicate::Gt(t)  => matches!((val.as_f64(), t.as_f64()), (Some(a), Some(b)) if a > b),
+            Predicate::Gte(t) => matches!((val.as_f64(), t.as_f64()), (Some(a), Some(b)) if a >= b),
+            Predicate::Lt(t)  => matches!((val.as_f64(), t.as_f64()), (Some(a), Some(b)) if a < b),
+            Predicate::Lte(t) => matches!((val.as_f64(), t.as_f64()), (Some(a), Some(b)) if a <= b),
         }
     }
 
