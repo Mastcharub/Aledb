@@ -1,0 +1,37 @@
+[
+  {
+    "age": 28,
+    "citta": "Milano",
+    "id": "2",
+    "name": "Mario",
+    "surname": "Rossi"
+  },
+  {
+    "age": 17,
+    "citta": "Prato",
+    "id": "1",
+    "name": "Alessandro",
+    "surname": "Sonnati"
+  },
+  {
+    "age": 45,
+    "citta": "Roma",
+    "id": "4",
+    "name": "Idk",
+    "surname": "Boh"
+  },
+  {
+    "age": 18,
+    "citta": "Prato",
+    "id": "9a68748d-9f41-4881-a3cd-a3df9a615e37",
+    "name": "Gianclaudio",
+    "surname": "Bruni"
+  },
+  {
+    "age": 67,
+    "citta": "Milano",
+    "id": "3",
+    "name": "Giuseppe",
+    "surname": "Cruciani"
+  }
+]

@@ -62,7 +62,7 @@ impl Query {
             }
         }
  
-        Ok(Query { select, filters })
+        Ok(Query {select, filters})
     }
 }
 
@@ -124,7 +124,7 @@ impl Aledb {
         Ok(())
     }
 
-    
+
     pub fn query(&self, q: &Query) -> Vec<Value> {
         self.data
             .values()
