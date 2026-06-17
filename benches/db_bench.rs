@@ -1,10 +1,10 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use serde_json::json;
 
-use AleDB::engine::{Aledb, Predicate, Query};
+use aledb::engine::{aledb, Predicate, Query};
 
-fn build_db(size: usize) -> Aledb {
-    let mut db = Aledb::new();
+fn build_db(size: usize) -> aledb {
+    let mut db = aledb::new();
 
     for i in 0..size {
         db.insert(json!({

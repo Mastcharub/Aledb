@@ -1,6 +1,7 @@
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
+use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 #[derive(Debug)]
@@ -74,22 +75,29 @@ fn value_key(v: &Value) -> String {
     v.to_string()
 }
 
-pub struct Aledb {
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+pub struct aledb {
     data:  HashMap<String, Value>,
     index: Index,
+    modified_at: HashMap<String, u64>,
 }
 
-impl Default for Aledb {
-    fn default() -> Self {
-        Self::new()
-    }
+impl Default for aledb {
+    fn default() -> Self { Self::new() }
 }
 
-impl Aledb {
+impl aledb {
     pub fn new() -> Self {
         Self {
-            data:  HashMap::new(),
+            data: HashMap::new(),
             index: HashMap::new(),
+            modified_at: HashMap::new(),
         }
     }
 
@@ -102,7 +110,7 @@ impl Aledb {
 
         doc["id"] = Value::String(id.clone());
         self.index_doc(&id, &doc);
-
+        self.modified_at.insert(id.clone(), now_ms());
         self.data.insert(id.clone(), doc);
         Ok(id)
     }
@@ -126,6 +134,7 @@ impl Aledb {
 
         if let Some(updated_doc) = self.data.get(id).cloned() {
             self.index_doc(id, &updated_doc);
+            self.modified_at.insert(id.to_string(), now_ms());
         }
     }
 
@@ -143,10 +152,36 @@ impl Aledb {
         for doc in docs {
             let id = doc["id"].as_str().ok_or("Missing id")?.to_string();
             self.index_doc(&id, &doc);
+            self.modified_at.insert(id.clone(), now_ms());
             self.data.insert(id, doc);
         }
 
         Ok(())
+    }
+
+    pub fn docs_since(&self, since_ms: u64) -> Vec<Value> {
+        self.modified_at
+            .iter()
+            .filter(|(_, &ts)| ts > since_ms)
+            .filter_map(|(id, _)| self.data.get(id).cloned())
+            .collect()
+    }
+
+    pub fn apply_docs(&mut self, docs: Vec<Value>, leader_ts: u64) {
+        for doc in docs {
+            let id = match doc["id"].as_str() {
+                Some(id) => id.to_string(),
+                None => continue,
+            };
+
+            if let Some(old) = self.data.get(&id).cloned() {
+                self.deindex_doc(&id, &old);
+            }
+
+            self.index_doc(&id, &doc);
+            self.modified_at.insert(id.clone(), leader_ts);
+            self.data.insert(id, doc);
+        }
     }
 
     pub fn query(&self, q: &Query) -> Vec<Value> {
@@ -178,11 +213,7 @@ impl Aledb {
             .index
             .get(best_field.as_str())
             .and_then(|m| m.get(&value_key(best_val)))
-            .map(|ids| {
-                ids.iter()
-                    .filter_map(|id| self.data.get(id))
-                    .collect()
-            })
+            .map(|ids| ids.iter().filter_map(|id| self.data.get(id)).collect())
             .unwrap_or_default();
 
         let remaining: Vec<(String, Predicate)> = rest

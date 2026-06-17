@@ -1,0 +1,43 @@
+services:
+
+  leader:
+    build: .
+    container_name: aledb-leader
+    environment:
+      - ROLE=leader
+    ports:
+      - "3000:3000"
+    networks:
+      - aledb
+
+  follower1:
+    build: .
+    container_name: aledb-follower1
+    environment:
+      - ROLE=follower
+      - LEADER_URL=http://leader:3000
+      - SYNC_INTERVAL_SECS=5
+    ports:
+      - "3001:3000" 
+    depends_on:
+      - leader
+    networks:
+      - aledb
+
+  follower2:
+    build: .
+    container_name: aledb-follower2
+    environment:
+      - ROLE=follower
+      - LEADER_URL=http://leader:3000
+      - SYNC_INTERVAL_SECS=5
+    ports:
+      - "3002:3000"
+    depends_on:
+      - leader
+    networks:
+      - aledb
+
+networks:
+  aledb:
+    driver: bridge
