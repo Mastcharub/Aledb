@@ -76,38 +76,123 @@ fn value_key(v: &Value) -> String {
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
 }
 
-pub struct aledb {
-    data:  HashMap<String, Value>,
-    index: Index,
-    modified_at: HashMap<String, u64>,
+//   PORT                porta HTTP                      default: 3000
+//   ROLE                leader | follower               default: leader
+//   LEADER_URL          URL del leader                  default: http://leader:3000
+//   SYNC_INTERVAL_SECS  intervallo sync follower (s)    default: 5
+//   AUTOLOAD_PATH       file JSON da caricare all'avvio default: "" (nessuno)
+//   SEGMENT_DIR         cartella dove salvare i segment default: ./segments
+//   SEGMENT_INTERVAL_SECS  intervallo autosave (s)      default: 60
+//   SHARD_KEY           campo usato per lo sharding     default: "" (nessuno)
+//   SHARD_INDEX         indice di questo shard (0-based)default: 0
+//   SHARD_TOTAL         numero totale di shard          default: 1
+
+#[derive(Clone, Debug)]
+pub struct Config {
+    pub port:                  u16,
+    pub role:                  String,
+    pub leader_url:            String,
+    pub sync_interval_secs:    u64,
+    pub autoload_path:         Option<String>,
+    pub segment_dir:           String,
+    pub segment_interval_secs: u64,
+    pub shard_key:             Option<String>,
+    pub shard_index:           u64,
+    pub shard_total:           u64,
 }
 
-impl Default for aledb {
-    fn default() -> Self { Self::new() }
+impl Config {
+    pub fn from_env() -> Self {
+        fn env(key: &str, default: &str) -> String {
+            std::env::var(key).unwrap_or_else(|_| default.to_string())
+        }
+        fn env_u64(key: &str, default: u64) -> u64 {
+            std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+        }
+
+        let autoload_path = match env("AUTOLOAD_PATH", "").as_str() {
+            "" => None,
+            p  => Some(p.to_string()),
+        };
+
+        let shard_key = match env("SHARD_KEY", "").as_str() {
+            "" => None,
+            k  => Some(k.to_string()),
+        };
+
+        Config {
+            port:                  env_u64("PORT", 3000) as u16,
+            role:                  env("ROLE", "leader"),
+            leader_url:            env("LEADER_URL", "http://leader:3000"),
+            sync_interval_secs:    env_u64("SYNC_INTERVAL_SECS", 5),
+            autoload_path,
+            segment_dir:           env("SEGMENT_DIR", "./segments"),
+            segment_interval_secs: env_u64("SEGMENT_INTERVAL_SECS", 60),
+            shard_key,
+            shard_index:           env_u64("SHARD_INDEX", 0),
+            shard_total:           env_u64("SHARD_TOTAL", 1),
+        }
+    }
 }
 
-impl aledb {
-    pub fn new() -> Self {
+pub struct Aledb {
+    pub config:      Config,
+    data:            HashMap<String, Value>,
+    index:           Index,
+    modified_at:     HashMap<String, u64>,
+}
+
+impl Aledb {
+    pub fn new(config: Config) -> Self {
         Self {
-            data: HashMap::new(),
-            index: HashMap::new(),
+            config,
+            data:        HashMap::new(),
+            index:       HashMap::new(),
             modified_at: HashMap::new(),
         }
     }
 
-    pub fn insert(&mut self, mut doc: Value) -> Result<String, String> {
-        let id = Uuid::new_v4().to_string();
+    pub fn autoload(&mut self) {
+        if let Some(path) = self.config.autoload_path.clone() {
+            match self.load(&path) {
+                Ok(_)  => println!("[DB] autoloaded from {}", path),
+                Err(e) => eprintln!("[DB] autoload failed ({}): {}", path, e),
+            }
+        }
+    }
 
+    pub fn save_segment(&self) -> Result<String, String> {
+        fs::create_dir_all(&self.config.segment_dir).map_err(|e| e.to_string())?;
+        let filename = format!("{}/{}.json", self.config.segment_dir, now_ms());
+        self.save(&filename)?;
+        Ok(filename)
+    }
+
+    // Algoritmo: hash FNV-1a del valore stringa del campo % shard_total.
+    pub fn owns_doc(&self, doc: &Value) -> bool {
+        if self.config.shard_total <= 1 {
+            return true;
+        }
+        let key = match &self.config.shard_key {
+            Some(k) => k,
+            None    => return true,
+        };
+        let val = match doc.get(key) {
+            Some(v) => v.to_string(),
+            None    => return true,
+        };
+        let hash = fnv1a(&val);
+        (hash % self.config.shard_total) == self.config.shard_index
+    }
+
+    pub fn insert(&mut self, mut doc: Value) -> Result<String, String> {
         if !doc.is_object() {
             return Err("Il documento deve essere un oggetto JSON".to_string());
         }
-
+        let id = Uuid::new_v4().to_string();
         doc["id"] = Value::String(id.clone());
         self.index_doc(&id, &doc);
         self.modified_at.insert(id.clone(), now_ms());
@@ -123,15 +208,11 @@ impl aledb {
         if let Some(old_doc) = self.data.get(id).cloned() {
             self.deindex_doc(id, &old_doc);
         }
-
         if let Some(existing) = self.data.get_mut(id) {
             if let (Value::Object(e), Value::Object(p)) = (existing, patch) {
-                for (k, v) in p {
-                    e.insert(k, v);
-                }
+                for (k, v) in p { e.insert(k, v); }
             }
         }
-
         if let Some(updated_doc) = self.data.get(id).cloned() {
             self.index_doc(id, &updated_doc);
             self.modified_at.insert(id.to_string(), now_ms());
@@ -148,14 +229,12 @@ impl aledb {
     pub fn load(&mut self, path: &str) -> Result<(), String> {
         let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
         let docs: Vec<Value> = serde_json::from_str(&content).map_err(|e| e.to_string())?;
-
         for doc in docs {
             let id = doc["id"].as_str().ok_or("Missing id")?.to_string();
             self.index_doc(&id, &doc);
             self.modified_at.insert(id.clone(), now_ms());
             self.data.insert(id, doc);
         }
-
         Ok(())
     }
 
@@ -173,11 +252,9 @@ impl aledb {
                 Some(id) => id.to_string(),
                 None => continue,
             };
-
             if let Some(old) = self.data.get(&id).cloned() {
                 self.deindex_doc(&id, &old);
             }
-
             self.index_doc(&id, &doc);
             self.modified_at.insert(id.clone(), leader_ts);
             self.data.insert(id, doc);
@@ -299,4 +376,13 @@ impl aledb {
             }
         }
     }
+}
+
+fn fnv1a(s: &str) -> u64 {
+    let mut hash: u64 = 14695981039346656037;
+    for byte in s.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(1099511628211);
+    }
+    hash
 }

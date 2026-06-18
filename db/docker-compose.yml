@@ -4,9 +4,16 @@ services:
     build: .
     container_name: aledb-leader
     environment:
-      - ROLE=leader
+      ROLE: leader
+      PORT: 3000
+      SEGMENT_DIR: /data/segments
+      SEGMENT_INTERVAL_SECS: 60
+      AUTOLOAD_PATH: /data/init.json
+      SHARD_KEY: tenant_id
+      SHARD_INDEX: 0
+      SHARD_TOTAL: 1
     ports:
-      - "3000:3000"
+      - "${LEADER_PORT:-3000}:3000"
     networks:
       - aledb
 
@@ -14,11 +21,14 @@ services:
     build: .
     container_name: aledb-follower1
     environment:
-      - ROLE=follower
-      - LEADER_URL=http://leader:3000
-      - SYNC_INTERVAL_SECS=5
+      ROLE: follower
+      PORT: 3000
+      LEADER_URL: http://leader:3000
+      SYNC_INTERVAL_SECS: 5
+      SEGMENT_DIR: /data/segments
+      SEGMENT_INTERVAL_SECS: 60
     ports:
-      - "3001:3000" 
+      - "${FOLLOWER1_PORT:-3001}:3000"
     depends_on:
       - leader
     networks:
@@ -28,11 +38,14 @@ services:
     build: .
     container_name: aledb-follower2
     environment:
-      - ROLE=follower
-      - LEADER_URL=http://leader:3000
-      - SYNC_INTERVAL_SECS=5
+      ROLE: follower
+      PORT: 3000
+      LEADER_URL: http://leader:3000
+      SYNC_INTERVAL_SECS: 5
+      SEGMENT_DIR: /data/segments
+      SEGMENT_INTERVAL_SECS: 60
     ports:
-      - "3002:3000"
+      - "${FOLLOWER2_PORT:-3002}:3000"
     depends_on:
       - leader
     networks:
