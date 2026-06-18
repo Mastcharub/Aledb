@@ -1,4 +1,4 @@
-/target
-/Cargo.lock
+db/target
+db/Cargo.lock
 /doc.json
-/benches/benchmarks
+db/benches/benchmarks
