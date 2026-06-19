@@ -1,6 +1,7 @@
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -76,32 +77,24 @@ fn value_key(v: &Value) -> String {
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
-
-//   PORT                porta HTTP                      default: 3000
-//   ROLE                leader | follower               default: leader
-//   LEADER_URL          URL del leader                  default: http://leader:3000
-//   SYNC_INTERVAL_SECS  intervallo sync follower (s)    default: 5
-//   AUTOLOAD_PATH       file JSON da caricare all'avvio default: "" (nessuno)
-//   SEGMENT_DIR         cartella dove salvare i segment default: ./segments
-//   SEGMENT_INTERVAL_SECS  intervallo autosave (s)      default: 60
-//   SHARD_KEY           campo usato per lo sharding     default: "" (nessuno)
-//   SHARD_INDEX         indice di questo shard (0-based)default: 0
-//   SHARD_TOTAL         numero totale di shard          default: 1
 
 #[derive(Clone, Debug)]
 pub struct Config {
-    pub port:                  u16,
-    pub role:                  String,
-    pub leader_url:            String,
-    pub sync_interval_secs:    u64,
-    pub autoload_path:         Option<String>,
-    pub segment_dir:           String,
-    pub segment_interval_secs: u64,
-    pub shard_key:             Option<String>,
-    pub shard_index:           u64,
-    pub shard_total:           u64,
+    pub port:                   u16,
+    pub role:                   String,
+    pub leader_url:             String,
+    pub sync_interval_secs:     u64,
+    pub autoload_path:          Option<String>,
+    pub segment_dir:            String,
+    pub segment_max_mb:         u64,
+    pub shard_key:              Option<String>,
+    pub shard_index:            u64,
+    pub shard_total:            u64,
 }
 
 impl Config {
@@ -130,7 +123,7 @@ impl Config {
             sync_interval_secs:    env_u64("SYNC_INTERVAL_SECS", 5),
             autoload_path,
             segment_dir:           env("SEGMENT_DIR", "./segments"),
-            segment_interval_secs: env_u64("SEGMENT_INTERVAL_SECS", 60),
+            segment_max_mb:        env_u64("SEGMENT_MAX_MB", 16),
             shard_key,
             shard_index:           env_u64("SHARD_INDEX", 0),
             shard_total:           env_u64("SHARD_TOTAL", 1),
@@ -139,39 +132,138 @@ impl Config {
 }
 
 pub struct Aledb {
-    pub config:      Config,
-    data:            HashMap<String, Value>,
-    index:           Index,
-    modified_at:     HashMap<String, u64>,
+    pub config:           Config,
+    data:                 HashMap<String, Value>,
+    index:                Index,
+    modified_at:          HashMap<String, u64>,
+    current_segment:      Option<String>,
 }
 
 impl Aledb {
     pub fn new(config: Config) -> Self {
         Self {
             config,
-            data:        HashMap::new(),
-            index:       HashMap::new(),
-            modified_at: HashMap::new(),
+            data:             HashMap::new(),
+            index:            HashMap::new(),
+            modified_at:      HashMap::new(),
+            current_segment:  None,
         }
     }
 
     pub fn autoload(&mut self) {
         if let Some(path) = self.config.autoload_path.clone() {
-            match self.load(&path) {
-                Ok(_)  => println!("[DB] autoloaded from {}", path),
-                Err(e) => eprintln!("[DB] autoload failed ({}): {}", path, e),
+            if std::path::Path::new(&path).exists() {
+                match self.load(&path) {
+                    Ok(_)  => println!("[DB] loaded init from {}", path),
+                    Err(e) => eprintln!("[DB] init load failed: {}", e),
+                }
             }
+        }
+        self.replay_segments();
+        self.open_segment();
+    }
+
+    fn replay_segments(&mut self) {
+        let mut paths = self.sorted_segments();
+        let last = paths.pop();
+
+        for path in &paths {
+            if let Err(e) = self.replay_file(path) {
+                eprintln!("[DB] replay error {}: {}", path, e);
+            }
+        }
+
+        if let Some(path) = last {
+            if let Err(e) = self.replay_file(&path) {
+                eprintln!("[DB] replay error {}: {}", path, e);
+            }
+            self.current_segment = Some(path);
         }
     }
 
-    pub fn save_segment(&self) -> Result<String, String> {
-        fs::create_dir_all(&self.config.segment_dir).map_err(|e| e.to_string())?;
-        let filename = format!("{}/{}.json", self.config.segment_dir, now_ms());
-        self.save(&filename)?;
-        Ok(filename)
+    fn replay_file(&mut self, path: &str) -> Result<(), String> {
+        let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() { continue; }
+            let op: Value = serde_json::from_str(line).map_err(|e| e.to_string())?;
+            match op["op"].as_str() {
+                Some("insert") => {
+                    if let Some(doc) = op.get("doc") {
+                        let id = doc["id"].as_str().ok_or("missing id")?.to_string();
+                        self.index_doc(&id, doc);
+                        self.modified_at.insert(id.clone(), now_ms());
+                        self.data.insert(id, doc.clone());
+                    }
+                }
+                Some("update") => {
+                    if let Some(doc) = op.get("doc") {
+                        let id = doc["id"].as_str().ok_or("missing id")?.to_string();
+                        if let Some(old) = self.data.get(&id).cloned() {
+                            self.deindex_doc(&id, &old);
+                        }
+                        self.index_doc(&id, doc);
+                        self.modified_at.insert(id.clone(), now_ms());
+                        self.data.insert(id, doc.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        println!("[DB] replayed {}", path);
+        Ok(())
     }
 
-    // Algoritmo: hash FNV-1a del valore stringa del campo % shard_total.
+    fn open_segment(&mut self) {
+        let dir = self.config.segment_dir.clone();
+        fs::create_dir_all(&dir).ok();
+
+        let max_bytes = self.config.segment_max_mb * 1024 * 1024;
+
+        let reuse = self.current_segment.as_ref().and_then(|p| {
+            let size = fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+            if size < max_bytes { Some(p.clone()) } else { None }
+        });
+
+        if reuse.is_none() {
+            let path = format!("{}/{}.log", dir, now_ms());
+            self.current_segment = Some(path);
+        }
+    }
+
+    fn append_op(&mut self, op: &str, doc: &Value) {
+        self.open_segment();
+        let path = match self.current_segment.clone() {
+            Some(p) => p,
+            None    => return,
+        };
+        let line = json!({ "op": op, "doc": doc }).to_string() + "
+";
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
+            file.write_all(line.as_bytes()).ok();
+        }
+    }
+
+    fn sorted_segments(&self) -> Vec<String> {
+        let Ok(entries) = fs::read_dir(&self.config.segment_dir) else { return vec![] };
+        let mut pairs: Vec<(u64, String)> = entries
+            .filter_map(|e| {
+                let path = e.ok()?.path();
+                if path.extension()?.to_str()? == "log" {
+                    let stem = path.file_stem()?.to_str()?.to_string();
+                    let ts: u64 = stem.parse().ok()?;
+                    Some((ts, path.to_string_lossy().to_string()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        pairs.sort_by_key(|(ts, _)| *ts);
+        pairs.into_iter().map(|(_, p)| p).collect()
+    }
+
+    /*---------Sharding---------*/
+
     pub fn owns_doc(&self, doc: &Value) -> bool {
         if self.config.shard_total <= 1 {
             return true;
@@ -196,6 +288,7 @@ impl Aledb {
         doc["id"] = Value::String(id.clone());
         self.index_doc(&id, &doc);
         self.modified_at.insert(id.clone(), now_ms());
+        self.append_op("insert", &doc);
         self.data.insert(id.clone(), doc);
         Ok(id)
     }
@@ -216,6 +309,7 @@ impl Aledb {
         if let Some(updated_doc) = self.data.get(id).cloned() {
             self.index_doc(id, &updated_doc);
             self.modified_at.insert(id.to_string(), now_ms());
+            self.append_op("update", &updated_doc);
         }
     }
 

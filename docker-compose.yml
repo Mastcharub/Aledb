@@ -1,0 +1,117 @@
+x-follower: &follower-base
+  build:
+    context: ./aledb
+  environment:
+    ROLE: follower
+    PORT: 3000
+    SYNC_INTERVAL_SECS: 5
+    SEGMENT_DIR: /data/segments
+    SEGMENT_MAX_MB: 16
+  networks:
+    - aledb
+
+services:
+  shard0-leader:
+    build:
+      context: ./aledb
+    container_name: shard0-leader
+    environment:
+      ROLE: leader
+      PORT: 3000
+      SEGMENT_DIR: /data/segments
+      SEGMENT_MAX_MB: 16
+      AUTOLOAD_PATH: /data/init.json
+      SHARD_KEY: tenant_id
+      SHARD_INDEX: 0
+      SHARD_TOTAL: 2
+    networks:
+      - aledb
+
+  shard0-follower1:
+    <<: *follower-base
+    container_name: shard0-follower1
+    environment:
+      ROLE: follower
+      PORT: 3000
+      LEADER_URL: http://shard0-leader:3000
+      SYNC_INTERVAL_SECS: 5
+      SEGMENT_DIR: /data/segments
+      SEGMENT_MAX_MB: 16
+    depends_on:
+      - shard0-leader
+
+  shard0-follower2:
+    <<: *follower-base
+    container_name: shard0-follower2
+    environment:
+      ROLE: follower
+      PORT: 3000
+      LEADER_URL: http://shard0-leader:3000
+      SYNC_INTERVAL_SECS: 5
+      SEGMENT_DIR: /data/segments
+      SEGMENT_MAX_MB: 16
+    depends_on:
+      - shard0-leader
+
+  shard1-leader:
+    build:
+      context: ./aledb
+    container_name: shard1-leader
+    environment:
+      ROLE: leader
+      PORT: 3000
+      SEGMENT_DIR: /data/segments
+      SEGMENT_MAX_MB: 16
+      AUTOLOAD_PATH: /data/init.json
+      SHARD_KEY: tenant_id
+      SHARD_INDEX: 1
+      SHARD_TOTAL: 2
+    networks:
+      - aledb
+
+  shard1-follower1:
+    <<: *follower-base
+    container_name: shard1-follower1
+    environment:
+      ROLE: follower
+      PORT: 3000
+      LEADER_URL: http://shard1-leader:3000
+      SYNC_INTERVAL_SECS: 5
+      SEGMENT_DIR: /data/segments
+      SEGMENT_MAX_MB: 16
+    depends_on:
+      - shard1-leader
+
+  shard1-follower2:
+    <<: *follower-base
+    container_name: shard1-follower2
+    environment:
+      ROLE: follower
+      PORT: 3000
+      LEADER_URL: http://shard1-leader:3000
+      SYNC_INTERVAL_SECS: 5
+      SEGMENT_DIR: /data/segments
+      SEGMENT_MAX_MB: 16
+    depends_on:
+      - shard1-leader
+      
+  gateway:
+    build:
+      context: ./gateway
+      dockerfile: Dockerfile.gateway
+    container_name: aledb-gateway
+    environment:
+      GATEWAY_PORT: 4000
+      SHARD_KEY: tenant_id
+      SHARD_LEADERS: http://shard0-leader:3000,http://shard1-leader:3000
+    ports:
+      - "4000:4000"
+    depends_on:
+      - shard0-leader
+      - shard1-leader
+    networks:
+      - aledb
+
+networks:
+  aledb:
+    driver: bridge

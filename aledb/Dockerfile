@@ -1,4 +1,4 @@
-#latest non funziona su WSL, pacchetti troppo grandi??
+# latest non funziona su WSL, forse pacchetti troppo grandi
 FROM rust:1.89-slim-bookworm AS builder
 
 WORKDIR /app

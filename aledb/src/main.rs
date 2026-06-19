@@ -10,7 +10,6 @@ use engine::{Aledb, Config, Query};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
-
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
@@ -43,14 +42,6 @@ async fn main() {
         });
     }
 
-    {
-        let db_ref        = Arc::clone(&state.db);
-        let interval_secs = config.segment_interval_secs;
-        tokio::spawn(async move {
-            segment_loop(db_ref, interval_secs).await;
-        });
-    }
-
     let app = Router::new()
         .route("/insert",      post(insert))
         .route("/get/{id}",    get(get_doc))
@@ -67,19 +58,6 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
-}
-
-async fn segment_loop(db: Arc<Mutex<Aledb>>, interval_secs: u64) {
-    let mut ticker = time::interval(Duration::from_secs(interval_secs));
-    ticker.tick().await;
-    loop {
-        ticker.tick().await;
-        let db = db.lock().unwrap();
-        match db.save_segment() {
-            Ok(path)  => println!("[SEGMENT] saved → {}", path),
-            Err(e)    => eprintln!("[SEGMENT] error: {}", e),
-        }
-    }
 }
 
 async fn sync_loop(db: Arc<Mutex<Aledb>>, leader_url: String, interval_secs: u64) {
@@ -118,7 +96,10 @@ async fn sync_loop(db: Arc<Mutex<Aledb>>, leader_url: String, interval_secs: u64
 #[derive(Deserialize)]
 struct SinceParams { since: Option<u64> }
 
-async fn sync_endpoint(State(state): State<AppState>, AxumQuery(params): AxumQuery<SinceParams>) -> Json<Value> {
+async fn sync_endpoint(
+    State(state): State<AppState>,
+    AxumQuery(params): AxumQuery<SinceParams>,
+) -> Json<Value> {
     let since = params.since.unwrap_or(0);
     let db    = state.db.lock().unwrap();
     let docs  = db.docs_since(since);
@@ -148,7 +129,11 @@ async fn get_doc(State(state): State<AppState>, Path(id): Path<String>) -> Json<
     }
 }
 
-async fn update_doc(State(state): State<AppState>, Path(id): Path<String>, Json(patch): Json<Value>) -> Json<Value> {
+async fn update_doc(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(patch): Json<Value>,
+) -> Json<Value> {
     let mut db = state.db.lock().unwrap();
     if db.config.role == "follower" {
         return Json(json!({ "error": "follower in sola lettura" }));

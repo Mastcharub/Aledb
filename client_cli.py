@@ -1,7 +1,7 @@
 import requests
 import json
 
-BASE_URL = "http://localhost:3000"
+BASE_URL = "http://localhost:4000"
 
 def _print(data):
     print(json.dumps(data, indent=2, ensure_ascii=False))

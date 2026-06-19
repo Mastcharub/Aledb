@@ -1,4 +1,3 @@
-db/target
-db/Cargo.lock
+aledb/target
+aledbdb/Cargo.lock
 /doc.json
-db/benches/benchmarks
