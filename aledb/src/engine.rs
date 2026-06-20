@@ -1,7 +1,7 @@
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufReader, Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -82,6 +82,7 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
         .as_millis() as u64
 }
+
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -182,11 +183,27 @@ impl Aledb {
     }
 
     fn replay_file(&mut self, path: &str) -> Result<(), String> {
-        let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
-        for line in content.lines() {
-            let line = line.trim();
-            if line.is_empty() { continue; }
-            let op: Value = serde_json::from_str(line).map_err(|e| e.to_string())?;
+        let file = File::open(path).map_err(|e| e.to_string())?;
+        let mut reader = BufReader::new(file);
+        let mut len_buf = [0u8; 4];
+
+        loop {
+            match reader.read_exact(&mut len_buf) {
+                Ok(_) => {}
+                Err(_) => break, 
+            }
+            let len = u32::from_le_bytes(len_buf) as usize;
+
+            let mut payload = vec![0u8; len];
+            if reader.read_exact(&mut payload).is_err() {
+                break; 
+            }
+
+            let op: Value = match rmp_serde::from_slice(&payload) {
+                Ok(v)  => v,
+                Err(_) => continue,
+            };
+
             match op["op"].as_str() {
                 Some("insert") => {
                     if let Some(doc) = op.get("doc") {
@@ -226,7 +243,7 @@ impl Aledb {
         });
 
         if reuse.is_none() {
-            let path = format!("{}/{}.log", dir, now_ms());
+            let path = format!("{}/{}.msgpack", dir, now_ms());
             self.current_segment = Some(path);
         }
     }
@@ -237,10 +254,17 @@ impl Aledb {
             Some(p) => p,
             None    => return,
         };
-        let line = json!({ "op": op, "doc": doc }).to_string() + "
-";
+
+        let record = serde_json::json!({ "op": op, "doc": doc });
+        let payload = match rmp_serde::to_vec(&record) {
+            Ok(p)  => p,
+            Err(_) => return,
+        };
+        let len = (payload.len() as u32).to_le_bytes();
+
         if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
-            file.write_all(line.as_bytes()).ok();
+            file.write_all(&len).ok();
+            file.write_all(&payload).ok();
         }
     }
 
@@ -249,7 +273,7 @@ impl Aledb {
         let mut pairs: Vec<(u64, String)> = entries
             .filter_map(|e| {
                 let path = e.ok()?.path();
-                if path.extension()?.to_str()? == "log" {
+                if path.extension()?.to_str()? == "msgpack" {
                     let stem = path.file_stem()?.to_str()?.to_string();
                     let ts: u64 = stem.parse().ok()?;
                     Some((ts, path.to_string_lossy().to_string()))
@@ -261,8 +285,6 @@ impl Aledb {
         pairs.sort_by_key(|(ts, _)| *ts);
         pairs.into_iter().map(|(_, p)| p).collect()
     }
-
-    /*---------Sharding---------*/
 
     pub fn owns_doc(&self, doc: &Value) -> bool {
         if self.config.shard_total <= 1 {

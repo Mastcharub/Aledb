@@ -2,17 +2,22 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 )
 
 type Gateway struct {
 	shardKey string
 	leaders  []string
+
+	tenantsMu sync.RWMutex
+	tenants   map[string]bool
 }
 
 var g Gateway
@@ -32,7 +37,7 @@ func initGateway() {
 		key = "tenant_id"
 	}
 
-	g = Gateway{shardKey: key, leaders: leaders}
+	g = Gateway{shardKey: key, leaders: leaders, tenants: make(map[string]bool)}
 	fmt.Printf("[gateway] %d shard(s), key=%q\n", len(g.leaders), g.shardKey)
 }
 
@@ -58,6 +63,18 @@ func extractKey(body []byte) string {
 		return fmt.Sprint(v)
 	}
 	return ""
+}
+
+func registerTenant(id string) {
+	g.tenantsMu.Lock()
+	defer g.tenantsMu.Unlock()
+	g.tenants[id] = true
+}
+
+func isValidTenant(id string) bool {
+	g.tenantsMu.RLock()
+	defer g.tenantsMu.RUnlock()
+	return g.tenants[id]
 }
 
 func proxyPost(w http.ResponseWriter, url string, body []byte) error {
@@ -95,6 +112,10 @@ func handleInsert(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, "campo shard_key mancante nel documento")
 		return
 	}
+	if !isValidTenant(key) {
+		writeErr(w, fmt.Sprintf("%s sconosciuto — registralo prima con POST /tenant/register", g.shardKey))
+		return
+	}
 	if err := proxyPost(w, leaderFor(key)+"/insert", body); err != nil {
 		writeErr(w, err.Error())
 	}
@@ -106,22 +127,14 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, "id mancante")
 		return
 	}
-	// GET per ID: non conosciamo il tenant, cerchiamo su tutti gli shard
-	for _, leader := range g.leaders {
-		resp, err := http.Get(leader + "/get/" + id)
-		if err != nil {
-			continue
-		}
-		defer resp.Body.Close()
-		var res map[string]any
-		json.NewDecoder(resp.Body).Decode(&res)
-		if _, hasErr := res["error"]; !hasErr {
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(res)
-			return
-		}
+	tenant := r.URL.Query().Get(g.shardKey)
+	if tenant == "" {
+		writeErr(w, fmt.Sprintf("parametro ?%s mancante — obbligatorio per isolare i tenant", g.shardKey))
+		return
 	}
-	writeErr(w, "not found")
+	if err := proxyGet(w, leaderFor(tenant)+"/get/"+id); err != nil {
+		writeErr(w, err.Error())
+	}
 }
 
 func handleUpdate(w http.ResponseWriter, r *http.Request) {
@@ -129,28 +142,17 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 
 	key := extractKey(body)
-	if key != "" {
-		if err := proxyPost(w, leaderFor(key)+"/update/"+id, body); err != nil {
-			writeErr(w, err.Error())
-		}
+	if key == "" {
+		key = r.URL.Query().Get(g.shardKey)
+	}
+	if key == "" {
+		writeErr(w, fmt.Sprintf("%s mancante nel body o in ?%s — obbligatorio per isolare i tenant", g.shardKey, g.shardKey))
 		return
 	}
 
-	for _, leader := range g.leaders {
-		resp, err := http.Post(leader+"/update/"+id, "application/json", bytes.NewBuffer(body))
-		if err != nil {
-			continue
-		}
-		defer resp.Body.Close()
-		var res map[string]any
-		json.NewDecoder(resp.Body).Decode(&res)
-		if res["status"] == "ok" {
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(res)
-			return
-		}
+	if err := proxyPost(w, leaderFor(key)+"/update/"+id, body); err != nil {
+		writeErr(w, err.Error())
 	}
-	writeErr(w, "update failed on all shards")
 }
 
 func handleQuery(w http.ResponseWriter, r *http.Request) {
@@ -159,47 +161,23 @@ func handleQuery(w http.ResponseWriter, r *http.Request) {
 	var payload map[string]any
 	json.Unmarshal(body, &payload)
 
-	if where, ok := payload["where"].(map[string]any); ok {
-		if val, ok := where[g.shardKey]; ok {
-			keyVal := fmt.Sprint(val)
-			leader := leaderFor(keyVal)
-			if err := proxyPost(w, leader+"/query", body); err != nil {
-				writeErr(w, err.Error())
-			}
-			return
-		}
+	where, ok := payload["where"].(map[string]any)
+	if !ok {
+		writeErr(w, fmt.Sprintf("'where.%s' obbligatorio — isola i risultati al tuo tenant", g.shardKey))
+		return
 	}
 
-	type shardResult struct {
-		results []any
-		count   float64
+	val, ok := where[g.shardKey]
+	if !ok {
+		writeErr(w, fmt.Sprintf("'where.%s' obbligatorio — isola i risultati al tuo tenant", g.shardKey))
+		return
 	}
 
-	var allResults []any
-	var totalCount float64
-
-	for _, leader := range g.leaders {
-		resp, err := http.Post(leader+"/query", "application/json", bytes.NewBuffer(body))
-		if err != nil {
-			continue
-		}
-		var res map[string]any
-		json.NewDecoder(resp.Body).Decode(&res)
-		resp.Body.Close()
-
-		if results, ok := res["results"].([]any); ok {
-			allResults = append(allResults, results...)
-		}
-		if c, ok := res["count"].(float64); ok {
-			totalCount += c
-		}
+	keyVal := fmt.Sprint(val)
+	leader := leaderFor(keyVal)
+	if err := proxyPost(w, leader+"/query", body); err != nil {
+		writeErr(w, err.Error())
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
-		"count":   totalCount,
-		"results": allResults,
-	})
 }
 
 func handleSave(w http.ResponseWriter, r *http.Request) {
@@ -260,6 +238,47 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func handleShardFor(w http.ResponseWriter, r *http.Request) {
+	tenant := r.URL.Query().Get(g.shardKey)
+	if tenant == "" {
+		writeErr(w, fmt.Sprintf("parametro ?%s mancante", g.shardKey))
+		return
+	}
+	idx := fnv1a(tenant) % uint64(len(g.leaders))
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		g.shardKey:    tenant,
+		"shard_index": idx,
+		"leader":      g.leaders[idx],
+	})
+}
+
+func newTenantID() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	b[6] = (b[6] & 0x0f) | 0x40 // versione 4
+	b[8] = (b[8] & 0x3f) | 0x80 // variant RFC 4122
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
+}
+
+func handleTenantRegister(w http.ResponseWriter, r *http.Request) {
+	id, err := newTenantID()
+	if err != nil {
+		writeErr(w, "generazione tenant_id fallita")
+		return
+	}
+	registerTenant(id)
+	idx := fnv1a(id) % uint64(len(g.leaders))
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		g.shardKey:    id,
+		"shard_index": idx,
+		"leader":      g.leaders[idx],
+	})
+}
+
 func main() {
 	initGateway()
 
@@ -274,6 +293,8 @@ func main() {
 	http.HandleFunc("/query",    handleQuery)
 	http.HandleFunc("/save",     handleSave)
 	http.HandleFunc("/load",     handleLoad)
+	http.HandleFunc("/tenant/register", handleTenantRegister)
+	http.HandleFunc("/shard-for", handleShardFor)
 	http.HandleFunc("/health",   handleHealth)
 
 	fmt.Printf("[gateway] listening on :%s\n", port)
