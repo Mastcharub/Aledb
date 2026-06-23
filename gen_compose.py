@@ -1,17 +1,13 @@
 #!/usr/bin/env python3
 """
-Genera docker-compose.yml a partire da .env.
+Generates docker-compose.yml from .env.
 
-Variabili lette da .env:
-  SHARD_COUNT          numero di shard (default: 2)
-  FOLLOWERS_PER_SHARD   numero di follower per shard (default: 2)
-  GATEWAY_PORT          porta esposta del gateway (default: 4000)
-  SEGMENT_MAX_MB        dimensione massima segment (default: 16)
-  SHARD_KEY             campo usato per lo sharding (default: tenant_id)
-
-Uso:
-  python3 generate_compose.py
-  docker compose up --build
+Variables read from .env:
+  SHARD_COUNT           
+  FOLLOWERS_PER_SHARD   
+  GATEWAY_PORT          
+  SEGMENT_MAX_MB        
+  SHARD_KEY             
 """
 
 import os

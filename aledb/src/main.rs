@@ -96,10 +96,7 @@ async fn sync_loop(db: Arc<Mutex<Aledb>>, leader_url: String, interval_secs: u64
 #[derive(Deserialize)]
 struct SinceParams { since: Option<u64> }
 
-async fn sync_endpoint(
-    State(state): State<AppState>,
-    AxumQuery(params): AxumQuery<SinceParams>,
-) -> Json<Value> {
+async fn sync_endpoint(State(state): State<AppState>, AxumQuery(params): AxumQuery<SinceParams>) -> Json<Value> {
     let since = params.since.unwrap_or(0);
     let db    = state.db.lock().unwrap();
     let docs  = db.docs_since(since);

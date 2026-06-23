@@ -1,7 +1,9 @@
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read, Write};
+use std::os::unix::io::AsRawFd;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -83,19 +85,29 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum FsyncMode {
+    Always,
+    Interval,
+    Never,
+}
 
 #[derive(Clone, Debug)]
 pub struct Config {
-    pub port:                   u16,
-    pub role:                   String,
-    pub leader_url:             String,
-    pub sync_interval_secs:     u64,
-    pub autoload_path:          Option<String>,
-    pub segment_dir:            String,
-    pub segment_max_mb:         u64,
-    pub shard_key:              Option<String>,
-    pub shard_index:            u64,
-    pub shard_total:            u64,
+    pub port:                 u16,
+    pub role:                 String,
+    pub leader_url:           String,
+    pub sync_interval_secs:   u64,
+    pub autoload_path:        Option<String>,
+    pub segment_dir:          String,
+    pub segment_max_mb:       u64,
+    pub compact_wal_count:    usize,
+    pub compact_wal_mb:       u64,
+    pub fsync_mode:           FsyncMode,
+    pub fsync_interval_ms:    u64,
+    pub shard_key:            Option<String>,
+    pub shard_index:          u64,
+    pub shard_total:          u64,
 }
 
 impl Config {
@@ -111,25 +123,42 @@ impl Config {
             "" => None,
             p  => Some(p.to_string()),
         };
-
         let shard_key = match env("SHARD_KEY", "").as_str() {
             "" => None,
             k  => Some(k.to_string()),
         };
+        let fsync_mode = match env("FSYNC", "interval").to_lowercase().as_str() {
+            "always"   => FsyncMode::Always,
+            "never"    => FsyncMode::Never,
+            _          => FsyncMode::Interval,
+        };
 
         Config {
-            port:                  env_u64("PORT", 3000) as u16,
-            role:                  env("ROLE", "leader"),
-            leader_url:            env("LEADER_URL", "http://leader:3000"),
-            sync_interval_secs:    env_u64("SYNC_INTERVAL_SECS", 5),
+            port:               env_u64("PORT", 3000) as u16,
+            role:               env("ROLE", "leader"),
+            leader_url:         env("LEADER_URL", "http://leader:3000"),
+            sync_interval_secs: env_u64("SYNC_INTERVAL_SECS", 5),
             autoload_path,
-            segment_dir:           env("SEGMENT_DIR", "./segments"),
-            segment_max_mb:        env_u64("SEGMENT_MAX_MB", 16),
+            segment_dir:        env("SEGMENT_DIR", "./segments"),
+            segment_max_mb:     env_u64("SEGMENT_MAX_MB", 64),
+            compact_wal_count:  env_u64("COMPACT_WAL_COUNT", 8) as usize,
+            compact_wal_mb:     env_u64("COMPACT_WAL_MB", 256),
+            fsync_mode,
+            fsync_interval_ms:  env_u64("FSYNC_INTERVAL_MS", 200),
             shard_key,
-            shard_index:           env_u64("SHARD_INDEX", 0),
-            shard_total:           env_u64("SHARD_TOTAL", 1),
+            shard_index:        env_u64("SHARD_INDEX", 0),
+            shard_total:        env_u64("SHARD_TOTAL", 1),
         }
     }
+}
+
+// DB engine
+
+#[derive(Serialize, Deserialize)]
+struct Snapshot {
+    ts:   u64,
+    data: HashMap<String, Value>,
+    index: HashMap<String, HashMap<String, Vec<String>>>,
 }
 
 pub struct Aledb {
@@ -137,7 +166,10 @@ pub struct Aledb {
     data:                 HashMap<String, Value>,
     index:                Index,
     modified_at:          HashMap<String, u64>,
-    current_segment:      Option<String>,
+    current_wal:          Option<File>,
+    current_wal_path:     Option<String>,
+    wal_paths:            Vec<String>,
+    pending_fsync:        bool,
 }
 
 impl Aledb {
@@ -147,57 +179,70 @@ impl Aledb {
             data:             HashMap::new(),
             index:            HashMap::new(),
             modified_at:      HashMap::new(),
-            current_segment:  None,
+            current_wal:      None,
+            current_wal_path: None,
+            wal_paths:        Vec::new(),
+            pending_fsync:    false,
         }
     }
 
     pub fn autoload(&mut self) {
-        if let Some(path) = self.config.autoload_path.clone() {
+        fs::create_dir_all(&self.config.segment_dir).ok();
+
+        // 1. Loads snapshot
+        if let Some(snap_path) = self.latest_file("snap") {
+            match self.load_snapshot(&snap_path) {
+                Ok(_)  => println!("[DB] snapshot loaded from {}", snap_path),
+                Err(e) => eprintln!("[DB] snapshot load failed: {}", e),
+            }
+        } else if let Some(path) = self.config.autoload_path.clone() {
+            // If no snapshot: loads init.json
             if std::path::Path::new(&path).exists() {
                 match self.load(&path) {
-                    Ok(_)  => println!("[DB] loaded init from {}", path),
+                    Ok(_)  => println!("[DB] init loaded from {}", path),
                     Err(e) => eprintln!("[DB] init load failed: {}", e),
                 }
             }
         }
-        self.replay_segments();
-        self.open_segment();
-    }
 
-    fn replay_segments(&mut self) {
-        let mut paths = self.sorted_segments();
-        let last = paths.pop();
+        // 2. WAL replays after snapshot (recent changes only)
+        let snap_ts = self.latest_file("snap")
+            .and_then(|p| self.ts_from_path(&p))
+            .unwrap_or(0);
 
-        for path in &paths {
-            if let Err(e) = self.replay_file(path) {
-                eprintln!("[DB] replay error {}: {}", path, e);
+        let wals = self.sorted_files_since("wal", snap_ts);
+        self.wal_paths = wals.clone();
+        for path in &wals {
+            if let Err(e) = self.replay_wal(path) {
+                eprintln!("[DB] WAL replay error {}: {}", path, e);
             }
         }
 
-        if let Some(path) = last {
-            if let Err(e) = self.replay_file(&path) {
-                eprintln!("[DB] replay error {}: {}", path, e);
-            }
-            self.current_segment = Some(path);
-        }
+        // 3. Opens a new WAL for current
+        self.rotate_wal();
     }
 
-    fn replay_file(&mut self, path: &str) -> Result<(), String> {
+    fn load_snapshot(&mut self, path: &str) -> Result<(), String> {
+        let bytes = fs::read(path).map_err(|e| e.to_string())?;
+        let snap: Snapshot = rmp_serde::from_slice(&bytes).map_err(|e| e.to_string())?;
+        self.data  = snap.data;
+        self.index = snap.index;
+        for id in self.data.keys() {
+            self.modified_at.insert(id.clone(), snap.ts);
+        }
+        Ok(())
+    }
+
+    fn replay_wal(&mut self, path: &str) -> Result<(), String> {
         let file = File::open(path).map_err(|e| e.to_string())?;
         let mut reader = BufReader::new(file);
         let mut len_buf = [0u8; 4];
 
         loop {
-            match reader.read_exact(&mut len_buf) {
-                Ok(_) => {}
-                Err(_) => break, 
-            }
+            if reader.read_exact(&mut len_buf).is_err() { break; }
             let len = u32::from_le_bytes(len_buf) as usize;
-
             let mut payload = vec![0u8; len];
-            if reader.read_exact(&mut payload).is_err() {
-                break; 
-            }
+            if reader.read_exact(&mut payload).is_err() { break; }
 
             let op: Value = match rmp_serde::from_slice(&payload) {
                 Ok(v)  => v,
@@ -213,69 +258,143 @@ impl Aledb {
                         self.data.insert(id, doc.clone());
                     }
                 }
-                Some("update") => {
-                    if let Some(doc) = op.get("doc") {
-                        let id = doc["id"].as_str().ok_or("missing id")?.to_string();
+                // Delta update
+                Some("patch") => {
+                    if let (Some(id), Some(fields)) = (op["id"].as_str(), op.get("fields")) {
+                        let id = id.to_string();
                         if let Some(old) = self.data.get(&id).cloned() {
                             self.deindex_doc(&id, &old);
                         }
-                        self.index_doc(&id, doc);
-                        self.modified_at.insert(id.clone(), now_ms());
-                        self.data.insert(id, doc.clone());
+                        if let Some(doc) = self.data.get_mut(&id) {
+                            if let (Value::Object(d), Value::Object(f)) = (doc, fields.clone()) {
+                                for (k, v) in f { d.insert(k, v); }
+                            }
+                        }
+                        if let Some(updated) = self.data.get(&id).cloned() {
+                            self.index_doc(&id, &updated);
+                            self.modified_at.insert(id, now_ms());
+                        }
                     }
                 }
                 _ => {}
             }
         }
-        println!("[DB] replayed {}", path);
+        println!("[DB] WAL replayed {}", path);
         Ok(())
     }
 
-    fn open_segment(&mut self) {
-        let dir = self.config.segment_dir.clone();
-        fs::create_dir_all(&dir).ok();
-
-        let max_bytes = self.config.segment_max_mb * 1024 * 1024;
-
-        let reuse = self.current_segment.as_ref().and_then(|p| {
-            let size = fs::metadata(p).map(|m| m.len()).unwrap_or(0);
-            if size < max_bytes { Some(p.clone()) } else { None }
-        });
-
-        if reuse.is_none() {
-            let path = format!("{}/{}.msgpack", dir, now_ms());
-            self.current_segment = Some(path);
+    fn rotate_wal(&mut self) {
+        let path = format!("{}/wal_{}.msgpack", self.config.segment_dir, now_ms());
+        match OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(file) => {
+                self.current_wal      = Some(file);
+                self.current_wal_path = Some(path.clone());
+                self.wal_paths.push(path);
+            }
+            Err(e) => eprintln!("[DB] failed to open WAL: {}", e),
         }
     }
 
-    fn append_op(&mut self, op: &str, doc: &Value) {
-        self.open_segment();
-        let path = match self.current_segment.clone() {
-            Some(p) => p,
-            None    => return,
-        };
-
-        let record = serde_json::json!({ "op": op, "doc": doc });
-        let payload = match rmp_serde::to_vec(&record) {
+    fn write_wal_record(&mut self, record: &Value) {
+        let payload = match rmp_serde::to_vec(record) {
             Ok(p)  => p,
             Err(_) => return,
         };
         let len = (payload.len() as u32).to_le_bytes();
 
-        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
+        if let Some(file) = &mut self.current_wal {
             file.write_all(&len).ok();
             file.write_all(&payload).ok();
+
+            match self.config.fsync_mode {
+                FsyncMode::Always => {
+                    unsafe { libc_fsync(file.as_raw_fd()); }
+                }
+                FsyncMode::Interval => {
+                    self.pending_fsync = true;
+                }
+                FsyncMode::Never => {}
+            }
+        }
+
+        let too_big = self.current_wal_path.as_ref()
+            .and_then(|p| fs::metadata(p).ok())
+            .map(|m| m.len() > self.config.segment_max_mb * 1024 * 1024)
+            .unwrap_or(false);
+        if too_big {
+            self.rotate_wal();
         }
     }
 
-    fn sorted_segments(&self) -> Vec<String> {
+    // Called by compaction loop in main.rs
+    pub fn compact(&mut self) -> Result<(), String> {
+        let wal_count = self.wal_paths.len();
+        let wal_mb: u64 = self.wal_paths.iter()
+            .filter_map(|p| fs::metadata(p).ok())
+            .map(|m| m.len())
+            .sum::<u64>() / (1024 * 1024);
+
+        let should = wal_count >= self.config.compact_wal_count
+            || wal_mb >= self.config.compact_wal_mb;
+
+        if !should {
+            return Ok(());
+        }
+
+        println!("[DB] compacting ({} WAL, {} MB)...", wal_count, wal_mb);
+
+        let snap_path = format!("{}/snap_{}.msgpack", self.config.segment_dir, now_ms());
+        let snap = Snapshot {
+            ts:    now_ms(),
+            data:  self.data.clone(),
+            index: self.index.clone(),
+        };
+        let bytes = rmp_serde::to_vec(&snap).map_err(|e| e.to_string())?;
+        fs::write(&snap_path, bytes).map_err(|e| e.to_string())?;
+
+        // Elimina snapshot e WAL vecchi
+        let old_snaps = self.sorted_files_since("snap", 0);
+        for p in &old_snaps {
+            if p != &snap_path { fs::remove_file(p).ok(); }
+        }
+        for p in &self.wal_paths.clone() {
+            fs::remove_file(p).ok();
+        }
+        self.wal_paths.clear();
+
+        // Opens new WAL
+        self.rotate_wal();
+        println!("[DB] compact done → {}", snap_path);
+        Ok(())
+    }
+
+    // periodic fsync
+    pub fn flush_fsync(&mut self) {
+        if self.pending_fsync {
+            if let Some(file) = &self.current_wal {
+                unsafe { libc_fsync(file.as_raw_fd()); }
+            }
+            self.pending_fsync = false;
+        }
+    }
+
+    fn latest_file(&self, prefix: &str) -> Option<String> {
+        self.sorted_files_since(prefix, 0).into_iter().last()
+    }
+
+    fn sorted_files_since(&self, prefix: &str, since_ts: u64) -> Vec<String> {
         let Ok(entries) = fs::read_dir(&self.config.segment_dir) else { return vec![] };
         let mut pairs: Vec<(u64, String)> = entries
             .filter_map(|e| {
                 let path = e.ok()?.path();
-                if path.extension()?.to_str()? == "msgpack" {
-                    let stem = path.file_stem()?.to_str()?.to_string();
-                    let ts: u64 = stem.parse().ok()?;
+                let name = path.file_name()?.to_str()?.to_string();
+                if !name.starts_with(prefix) || path.extension()?.to_str()? != "msgpack" {
+                    return None;
+                }
+                let stem = path.file_stem()?.to_str()?.to_string();
+                let ts_str = stem.trim_start_matches(&format!("{}_", prefix));
+                let ts: u64 = ts_str.parse().ok()?;
+                if ts > since_ts {
                     Some((ts, path.to_string_lossy().to_string()))
                 } else {
                     None
@@ -286,6 +405,12 @@ impl Aledb {
         pairs.into_iter().map(|(_, p)| p).collect()
     }
 
+    fn ts_from_path(&self, path: &str) -> Option<u64> {
+        let stem = std::path::Path::new(path).file_stem()?.to_str()?.to_string();
+        stem.rsplit('_').next()?.parse().ok()
+    }
+
+    // Sharding
     pub fn owns_doc(&self, doc: &Value) -> bool {
         if self.config.shard_total <= 1 {
             return true;
@@ -310,7 +435,7 @@ impl Aledb {
         doc["id"] = Value::String(id.clone());
         self.index_doc(&id, &doc);
         self.modified_at.insert(id.clone(), now_ms());
-        self.append_op("insert", &doc);
+        self.write_wal_record(&serde_json::json!({ "op": "insert", "doc": &doc }));
         self.data.insert(id.clone(), doc);
         Ok(id)
     }
@@ -323,6 +448,8 @@ impl Aledb {
         if let Some(old_doc) = self.data.get(id).cloned() {
             self.deindex_doc(id, &old_doc);
         }
+        // Only writes delta
+        self.write_wal_record(&serde_json::json!({ "op": "patch", "id": id, "fields": &patch }));
         if let Some(existing) = self.data.get_mut(id) {
             if let (Value::Object(e), Value::Object(p)) = (existing, patch) {
                 for (k, v) in p { e.insert(k, v); }
@@ -331,7 +458,6 @@ impl Aledb {
         if let Some(updated_doc) = self.data.get(id).cloned() {
             self.index_doc(id, &updated_doc);
             self.modified_at.insert(id.to_string(), now_ms());
-            self.append_op("update", &updated_doc);
         }
     }
 
@@ -342,6 +468,8 @@ impl Aledb {
         Ok(())
     }
 
+    // Loads documents from files, adding them to those already in memory.
+    // Existing documents with the same ID are overwritten.
     pub fn load(&mut self, path: &str) -> Result<(), String> {
         let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
         let docs: Vec<Value> = serde_json::from_str(&content).map_err(|e| e.to_string())?;
@@ -492,6 +620,12 @@ impl Aledb {
             }
         }
     }
+}
+
+// fsync syscall
+unsafe fn libc_fsync(fd: i32) {
+    extern "C" { fn fsync(fd: i32) -> i32; }
+    fsync(fd);
 }
 
 fn fnv1a(s: &str) -> u64 {
