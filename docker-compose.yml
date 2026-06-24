@@ -104,6 +104,8 @@ services:
       GATEWAY_PORT: 4000
       SHARD_KEY: tenant_id
       SHARD_LEADERS: http://shard0-leader:3000,http://shard1-leader:3000
+    volumes:
+      - gateway-data:/data
     ports:
       - "4000:4000"
     depends_on:
@@ -115,3 +117,6 @@ services:
 networks:
   aledb:
     driver: bridge
+
+volumes:
+  gateway-data:
