@@ -48,7 +48,7 @@ impl Query {
                 let fields: Result<Vec<String>, _> = arr
                     .iter()
                     .map(|v| v.as_str().map(|s| s.to_string())
-                        .ok_or("select deve contenere stringhe"))
+                    .ok_or("select deve contenere stringhe"))
                     .collect();
                 Some(fields?)
             }
@@ -354,6 +354,7 @@ impl Aledb {
             Ok(p)  => p,
             Err(_) => return,
         };
+        
         let len = (payload.len() as u32).to_le_bytes();
 
         if let Some(file) = &mut self.current_wal {
