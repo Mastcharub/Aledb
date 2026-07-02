@@ -62,6 +62,7 @@ async fn main() {
         .route("/sync",           get(sync_endpoint))
         .route("/migrate/export", post(migrate_export))
         .route("/migrate/import", post(migrate_import))
+        .route("/collections",    get(list_collections))
         .route("/health",         get(health))
         .with_state(state);
 
@@ -128,7 +129,10 @@ async fn sync_loop(db: Arc<RwLock<Aledb>>, leader_url: String, interval_secs: u6
 #[derive(Deserialize)]
 struct SinceParams { since: Option<u64> }
 
-async fn sync_endpoint(State(state): State<AppState>, AxumQuery(params): AxumQuery<SinceParams>) -> Json<Value> {
+async fn sync_endpoint(
+    State(state): State<AppState>,
+    AxumQuery(params): AxumQuery<SinceParams>,
+) -> Json<Value> {
     let since = params.since.unwrap_or(0);
     let db    = state.db.read().unwrap();
     let docs  = db.docs_since(since);
@@ -147,7 +151,10 @@ struct ExportParams {
     delete: bool,
 }
 
-async fn migrate_export(State(state): State<AppState>, Json(params): Json<Value>) -> Json<Value> {
+async fn migrate_export(
+    State(state): State<AppState>,
+    Json(params): Json<Value>,
+) -> Json<Value> {
     let shard_key = match params["shard_key"].as_str() {
         Some(k) => k.to_string(),
         None    => return Json(json!({ "error": "shard_key mancante" })),
@@ -167,7 +174,10 @@ async fn migrate_export(State(state): State<AppState>, Json(params): Json<Value>
     Json(json!({ "count": docs.len(), "docs": docs }))
 }
 
-async fn migrate_import(State(state): State<AppState>, Json(payload): Json<Value>) -> Json<Value> {
+async fn migrate_import(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> Json<Value> {
     let docs = match payload["docs"].as_array() {
         Some(d) => d.clone(),
         None    => return Json(json!({ "error": "docs mancante" })),
@@ -181,13 +191,20 @@ async fn migrate_import(State(state): State<AppState>, Json(payload): Json<Value
     Json(json!({ "imported": count }))
 }
 
-async fn insert(State(state): State<AppState>, Json(doc): Json<Value>) -> Json<Value> {
+async fn insert(State(state): State<AppState>, Json(mut payload): Json<Value>) -> Json<Value> {
     let mut db = state.db.write().unwrap();
     if db.config.role == "follower" {
         return Json(json!({ "error": "follower in sola lettura" }));
     }
-    match db.insert(doc) {
-        Ok(id) => Json(json!({ "id": id })),
+    let collection = payload.get("_collection")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    if let Some(obj) = payload.as_object_mut() {
+        obj.remove("_collection");
+    }
+    let coll_ref = collection.as_deref();
+    match db.insert(payload, coll_ref) {
+        Ok(id) => Json(json!({ "id": id, "collection": collection })),
         Err(e) => Json(json!({ "error": e })),
     }
 }
@@ -200,7 +217,11 @@ async fn get_doc(State(state): State<AppState>, Path(id): Path<String>) -> Json<
     }
 }
 
-async fn update_doc(State(state): State<AppState>, Path(id): Path<String>, Json(patch): Json<Value>) -> Json<Value> {
+async fn update_doc(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(patch): Json<Value>,
+) -> Json<Value> {
     let mut db = state.db.write().unwrap();
     if db.config.role == "follower" {
         return Json(json!({ "error": "follower in sola lettura" }));
@@ -209,7 +230,10 @@ async fn update_doc(State(state): State<AppState>, Path(id): Path<String>, Json(
     Json(json!({ "status": "ok" }))
 }
 
-async fn delete_doc(State(state): State<AppState>, Path(id): Path<String>) -> Json<Value> {
+async fn delete_doc(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Json<Value> {
     let mut db = state.db.write().unwrap();
     if db.config.role == "follower" {
         return Json(json!({ "error": "follower in sola lettura" }));
@@ -245,6 +269,15 @@ async fn load(State(state): State<AppState>, Json(payload): Json<Value>) -> Json
         Ok(_)  => Json(json!({ "status": "loaded", "file": path })),
         Err(e) => Json(json!({ "error": e })),
     }
+}
+
+async fn list_collections(State(state): State<AppState>) -> Json<Value> {
+    let db   = state.db.read().unwrap();
+    let list = db.list_collections();
+    let detail: Vec<Value> = list.iter().map(|(name, count)| {
+        json!({ "name": name, "count": count })
+    }).collect();
+    Json(json!({ "collections": detail }))
 }
 
 async fn health(State(state): State<AppState>) -> Json<Value> {

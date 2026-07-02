@@ -25,7 +25,7 @@ pub enum Filter {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum SortDir { Asc, Desc }
+pub enum SortDir {Asc, Desc}
 
 #[derive(Debug, Clone)]
 pub struct SortKey {
@@ -34,11 +34,12 @@ pub struct SortKey {
 }
 
 pub struct Query {
-    pub select:  Option<Vec<String>>,
-    pub filter:  Option<Filter>,
-    pub order:   Vec<SortKey>,
-    pub limit:   Option<usize>,
-    pub offset:  usize,
+    pub select:     Option<Vec<String>>,
+    pub collection: Option<String>,
+    pub filter:     Option<Filter>,
+    pub order:      Vec<SortKey>,
+    pub limit:      Option<usize>,
+    pub offset:     usize,
 }
 
 impl Query {
@@ -47,8 +48,7 @@ impl Query {
             Some(Value::Array(arr)) => {
                 let fields: Result<Vec<String>, _> = arr
                     .iter()
-                    .map(|v| v.as_str().map(|s| s.to_string())
-                    .ok_or("select deve contenere stringhe"))
+                    .map(|v| v.as_str().map(|s| s.to_string()).ok_or("select deve contenere stringhe"))
                     .collect();
                 Some(fields?)
             }
@@ -64,7 +64,7 @@ impl Query {
         let order = match raw.get("order") {
             Some(Value::Array(arr)) => arr.iter().map(|o| {
                 let field = o["field"].as_str().ok_or("order.field mancante")?.to_string();
-                let dir   = match o["dir"].as_str().unwrap_or("asc").to_lowercase().as_str() {
+                let dir = match o["dir"].as_str().unwrap_or("asc").to_lowercase().as_str() {
                     "desc" => SortDir::Desc,
                     _      => SortDir::Asc,
                 };
@@ -73,10 +73,11 @@ impl Query {
             _ => vec![],
         };
 
-        let limit  = raw.get("limit").and_then(|v| v.as_u64()).map(|n| n as usize);
-        let offset = raw.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let limit      = raw.get("limit").and_then(|v| v.as_u64()).map(|n| n as usize);
+        let offset     = raw.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let collection = raw.get("collection").and_then(|v| v.as_str()).map(|s| s.to_string());
 
-        Ok(Query { select, filter, order, limit, offset })
+        Ok(Query { select, collection, filter, order, limit, offset })
     }
 
     fn parse_filter(v: &Value) -> Result<Filter, String> {
@@ -88,7 +89,6 @@ impl Query {
             let children: Result<Vec<_>, _> = arr.iter().map(Self::parse_filter).collect();
             return Ok(Filter::Or(children?));
         }
-
         if let Some(obj) = v.as_object() {
             let mut conds = vec![];
             for (field, cond) in obj {
@@ -172,7 +172,6 @@ impl Config {
         fn env_u64(key: &str, default: u64) -> u64 {
             std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
         }
-
         let autoload_path = match env("AUTOLOAD_PATH", "").as_str() {
             "" => None,
             p  => Some(p.to_string()),
@@ -182,11 +181,10 @@ impl Config {
             k  => Some(k.to_string()),
         };
         let fsync_mode = match env("FSYNC", "interval").to_lowercase().as_str() {
-            "always"   => FsyncMode::Always,
-            "never"    => FsyncMode::Never,
-            _          => FsyncMode::Interval,
+            "always" => FsyncMode::Always,
+            "never"  => FsyncMode::Never,
+            _        => FsyncMode::Interval,
         };
-
         Config {
             port:               env_u64("PORT", 3000) as u16,
             role:               env("ROLE", "leader"),
@@ -208,20 +206,22 @@ impl Config {
 
 #[derive(Serialize, Deserialize)]
 struct Snapshot {
-    ts:   u64,
-    data: HashMap<String, Value>,
-    index: HashMap<String, HashMap<String, Vec<String>>>,
+    ts:          u64,
+    data:        HashMap<String, Value>,
+    index:       HashMap<String, HashMap<String, Vec<String>>>,
+    collections: HashMap<String, Vec<String>>,
 }
 
 pub struct Aledb {
-    pub config:           Config,
-    data:                 HashMap<String, Value>,
-    index:                Index,
-    modified_at:          HashMap<String, u64>,
-    current_wal:          Option<File>,
-    current_wal_path:     Option<String>,
-    wal_paths:            Vec<String>,
-    pending_fsync:        bool,
+    pub config:       Config,
+    data:             HashMap<String, Value>,
+    index:            Index,
+    modified_at:      HashMap<String, u64>,
+    collections:      HashMap<String, Vec<String>>,
+    current_wal:      Option<File>,
+    current_wal_path: Option<String>,
+    wal_paths:        Vec<String>,
+    pending_fsync:    bool,
 }
 
 impl Aledb {
@@ -231,6 +231,7 @@ impl Aledb {
             data:             HashMap::new(),
             index:            HashMap::new(),
             modified_at:      HashMap::new(),
+            collections:      HashMap::new(),
             current_wal:      None,
             current_wal_path: None,
             wal_paths:        Vec::new(),
@@ -254,6 +255,7 @@ impl Aledb {
                 }
             }
         }
+
         let snap_ts = self.latest_file("snap")
             .and_then(|p| self.ts_from_path(&p))
             .unwrap_or(0);
@@ -265,14 +267,16 @@ impl Aledb {
                 eprintln!("[DB] WAL replay error {}: {}", path, e);
             }
         }
+
         self.rotate_wal();
     }
 
     fn load_snapshot(&mut self, path: &str) -> Result<(), String> {
         let bytes = fs::read(path).map_err(|e| e.to_string())?;
         let snap: Snapshot = rmp_serde::from_slice(&bytes).map_err(|e| e.to_string())?;
-        self.data  = snap.data;
-        self.index = snap.index;
+        self.data        = snap.data;
+        self.index       = snap.index;
+        self.collections = snap.collections;
         for id in self.data.keys() {
             self.modified_at.insert(id.clone(), snap.ts);
         }
@@ -301,6 +305,9 @@ impl Aledb {
                         let id = doc["id"].as_str().ok_or("missing id")?.to_string();
                         self.index_doc(&id, doc);
                         self.modified_at.insert(id.clone(), now_ms());
+                        if let Some(coll) = op["collection"].as_str() {
+                            self.collections.entry(coll.to_string()).or_default().push(id.clone());
+                        }
                         self.data.insert(id, doc.clone());
                     }
                 }
@@ -328,6 +335,9 @@ impl Aledb {
                             self.deindex_doc(&id, &doc);
                             self.modified_at.remove(&id);
                         }
+                        for ids in self.collections.values_mut() {
+                            ids.retain(|x| x != &id);
+                        }
                     }
                 }
                 _ => {}
@@ -354,21 +364,15 @@ impl Aledb {
             Ok(p)  => p,
             Err(_) => return,
         };
-        
         let len = (payload.len() as u32).to_le_bytes();
 
         if let Some(file) = &mut self.current_wal {
             file.write_all(&len).ok();
             file.write_all(&payload).ok();
-
             match self.config.fsync_mode {
-                FsyncMode::Always => {
-                    unsafe { libc_fsync(file.as_raw_fd()); }
-                }
-                FsyncMode::Interval => {
-                    self.pending_fsync = true;
-                }
-                FsyncMode::Never => {}
+                FsyncMode::Always   => unsafe { libc_fsync(file.as_raw_fd()); },
+                FsyncMode::Interval => { self.pending_fsync = true; }
+                FsyncMode::Never    => {}
             }
         }
 
@@ -388,10 +392,7 @@ impl Aledb {
             .map(|m| m.len())
             .sum::<u64>() / (1024 * 1024);
 
-        let should = wal_count >= self.config.compact_wal_count
-            || wal_mb >= self.config.compact_wal_mb;
-
-        if !should {
+        if wal_count < self.config.compact_wal_count && wal_mb < self.config.compact_wal_mb {
             return Ok(());
         }
 
@@ -399,21 +400,20 @@ impl Aledb {
 
         let snap_path = format!("{}/snap_{}.msgpack", self.config.segment_dir, now_ms());
         let snap = Snapshot {
-            ts:    now_ms(),
-            data:  self.data.clone(),
-            index: self.index.clone(),
+            ts:          now_ms(),
+            data:        self.data.clone(),
+            index:       self.index.clone(),
+            collections: self.collections.clone(),
         };
         let bytes = rmp_serde::to_vec(&snap).map_err(|e| e.to_string())?;
         fs::write(&snap_path, bytes).map_err(|e| e.to_string())?;
 
-        let old_snaps = self.sorted_files_since("snap", 0);
-        for p in &old_snaps {
-            if p != &snap_path { fs::remove_file(p).ok(); }
+        for p in self.sorted_files_since("snap", 0) {
+            if p != snap_path { fs::remove_file(&p).ok(); }
         }
-        for p in &self.wal_paths.clone() {
-            fs::remove_file(p).ok();
+        for p in self.wal_paths.drain(..).collect::<Vec<_>>() {
+            fs::remove_file(&p).ok();
         }
-        self.wal_paths.clear();
 
         self.rotate_wal();
         println!("[DB] compact done → {}", snap_path);
@@ -434,7 +434,7 @@ impl Aledb {
     }
 
     fn sorted_files_since(&self, prefix: &str, since_ts: u64) -> Vec<String> {
-        let Ok(entries) = fs::read_dir(&self.config.segment_dir) else { return vec![] };
+        let Ok(entries) = fs::read_dir(&self.config.segment_dir) else { return vec![]; };
         let mut pairs: Vec<(u64, String)> = entries
             .filter_map(|e| {
                 let path = e.ok()?.path();
@@ -442,14 +442,10 @@ impl Aledb {
                 if !name.starts_with(prefix) || path.extension()?.to_str()? != "msgpack" {
                     return None;
                 }
-                let stem = path.file_stem()?.to_str()?.to_string();
+                let stem   = path.file_stem()?.to_str()?.to_string();
                 let ts_str = stem.trim_start_matches(&format!("{}_", prefix));
                 let ts: u64 = ts_str.parse().ok()?;
-                if ts > since_ts {
-                    Some((ts, path.to_string_lossy().to_string()))
-                } else {
-                    None
-                }
+                if ts > since_ts { Some((ts, path.to_string_lossy().to_string())) } else { None }
             })
             .collect();
         pairs.sort_by_key(|(ts, _)| *ts);
@@ -462,9 +458,7 @@ impl Aledb {
     }
 
     pub fn owns_doc(&self, doc: &Value) -> bool {
-        if self.config.shard_total <= 1 {
-            return true;
-        }
+        if self.config.shard_total <= 1 { return true; }
         let key = match &self.config.shard_key {
             Some(k) => k,
             None    => return true,
@@ -473,11 +467,10 @@ impl Aledb {
             Some(v) => v.to_string(),
             None    => return true,
         };
-        let hash = fnv1a(&val);
-        (hash % self.config.shard_total) == self.config.shard_index
+        (fnv1a(&val) % self.config.shard_total) == self.config.shard_index
     }
 
-    pub fn insert(&mut self, mut doc: Value) -> Result<String, String> {
+    pub fn insert(&mut self, mut doc: Value, collection: Option<&str>) -> Result<String, String> {
         if !doc.is_object() {
             return Err("Il documento deve essere un oggetto JSON".to_string());
         }
@@ -485,7 +478,14 @@ impl Aledb {
         doc["id"] = Value::String(id.clone());
         self.index_doc(&id, &doc);
         self.modified_at.insert(id.clone(), now_ms());
-        self.write_wal_record(&serde_json::json!({ "op": "insert", "doc": &doc }));
+        let wal_record = match collection {
+            Some(c) => {
+                self.collections.entry(c.to_string()).or_default().push(id.clone());
+                serde_json::json!({ "op": "insert", "collection": c, "doc": &doc })
+            }
+            None => serde_json::json!({ "op": "insert", "doc": &doc }),
+        };
+        self.write_wal_record(&wal_record);
         self.data.insert(id.clone(), doc);
         Ok(id)
     }
@@ -498,6 +498,9 @@ impl Aledb {
         if let Some(doc) = self.data.remove(id) {
             self.deindex_doc(id, &doc);
             self.modified_at.remove(id);
+            for ids in self.collections.values_mut() {
+                ids.retain(|x| x != id);
+            }
             self.write_wal_record(&serde_json::json!({ "op": "delete", "id": id }));
         }
     }
@@ -549,7 +552,7 @@ impl Aledb {
         for doc in docs {
             let id = match doc["id"].as_str() {
                 Some(id) => id.to_string(),
-                None => continue,
+                None     => continue,
             };
             if let Some(old) = self.data.get(&id).cloned() {
                 self.deindex_doc(&id, &old);
@@ -560,102 +563,11 @@ impl Aledb {
         }
     }
 
-    pub fn query(&self, q: &Query) -> Vec<Value> {
-        let mut results: Vec<Value> = if let Some(filter) = &q.filter {
-            if let Some(ids) = self.index_hint(filter) {
-                ids.iter()
-                    .filter_map(|id| self.data.get(id))
-                    .filter(|doc| Self::eval_filter(doc, filter))
-                    .map(|doc| Self::project(doc, &q.select))
-                    .collect()
-            } else {
-                self.data
-                    .values()
-                    .filter(|doc| Self::eval_filter(doc, filter))
-                    .map(|doc| Self::project(doc, &q.select))
-                    .collect()
-            }
-        } else {
-            self.data.values()
-                .map(|doc| Self::project(doc, &q.select))
-                .collect()
-        };
-
-        if !q.order.is_empty() {
-            results.sort_by(|a, b| {
-                for key in &q.order {
-                    let av = a.get(&key.field);
-                    let bv = b.get(&key.field);
-                    let ord = Self::cmp_values(av, bv);
-                    let ord = if key.dir == SortDir::Desc { ord.reverse() } else { ord };
-                    if ord != std::cmp::Ordering::Equal { return ord; }
-                }
-                std::cmp::Ordering::Equal
-            });
-        }
-
-        let start = q.offset.min(results.len());
-        let results = results.into_iter().skip(start);
-        match q.limit {
-            Some(n) => results.take(n).collect(),
-            None    => results.collect(),
-        }
-    }
-
-    fn index_hint(&self, filter: &Filter) -> Option<Vec<String>> {
-        match filter {
-            Filter::Cond(field, Predicate::Eq(val)) => {
-                self.index
-                    .get(field.as_str())
-                    .and_then(|m| m.get(&value_key(val)))
-                    .map(|ids| ids.clone())
-            }
-            Filter::And(children) => {
-                children.iter()
-                    .filter_map(|c| self.index_hint(c))
-                    .min_by_key(|ids| ids.len())
-            }
-            _ => None,
-        }
-    }
-
-    fn eval_filter(doc: &Value, filter: &Filter) -> bool {
-        match filter {
-            Filter::Cond(field, pred) => {
-                match doc.get(field) {
-                    Some(v) => Self::eval_pred(v, pred),
-                    None    => false,
-                }
-            }
-            Filter::And(children) => children.iter().all(|f| Self::eval_filter(doc, f)),
-            Filter::Or(children)  => children.iter().any(|f| Self::eval_filter(doc, f)),
-        }
-    }
-
-    fn eval_pred(val: &Value, pred: &Predicate) -> bool {
-        match pred {
-            Predicate::Eq(e)   => val == e,
-            Predicate::Gt(t)   => matches!((val.as_f64(), t.as_f64()), (Some(a), Some(b)) if a > b),
-            Predicate::Gte(t)  => matches!((val.as_f64(), t.as_f64()), (Some(a), Some(b)) if a >= b),
-            Predicate::Lt(t)   => matches!((val.as_f64(), t.as_f64()), (Some(a), Some(b)) if a < b),
-            Predicate::Lte(t)  => matches!((val.as_f64(), t.as_f64()), (Some(a), Some(b)) if a <= b),
-            Predicate::In(lst) => lst.contains(val),
-        }
-    }
-
-    fn cmp_values(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
-        match (a, b) {
-            (None, None)    => std::cmp::Ordering::Equal,
-            (None, _)       => std::cmp::Ordering::Greater,
-            (_, None)       => std::cmp::Ordering::Less,
-            (Some(x), Some(y)) => {
-                if let (Some(xf), Some(yf)) = (x.as_f64(), y.as_f64()) {
-                    xf.partial_cmp(&yf).unwrap_or(std::cmp::Ordering::Equal)
-                } else {
-                    x.to_string().cmp(&y.to_string())
-                }
-            }
-        }
+    pub fn list_collections(&self) -> Vec<(String, usize)> {
+        self.collections
+            .iter()
+            .map(|(name, ids)| (name.clone(), ids.len()))
+            .collect()
     }
 
     pub fn docs_for_tenant(&self, shard_key: &str, tenant_id: &str) -> Vec<Value> {
@@ -674,7 +586,107 @@ impl Aledb {
             if let Some(doc) = self.data.remove(&id) {
                 self.deindex_doc(&id, &doc);
                 self.modified_at.remove(&id);
-                self.write_wal_record(&serde_json::json!({ "op": "delete", "id": id }));
+                for ids in self.collections.values_mut() {
+                    ids.retain(|x| x != &id);
+                }
+                self.write_wal_record(&serde_json::json!({ "op": "delete", "id": &id }));
+            }
+        }
+    }
+
+    pub fn query(&self, q: &Query) -> Vec<Value> {
+        let collection_ids: Option<&Vec<String>> = q.collection
+            .as_deref()
+            .and_then(|c| self.collections.get(c));
+
+        let mut results: Vec<Value> = if let Some(filter) = &q.filter {
+            let base: Vec<&Value> = match collection_ids {
+                Some(ids) => ids.iter().filter_map(|id| self.data.get(id)).collect(),
+                None => match self.index_hint(filter) {
+                    Some(hint_ids) => hint_ids.iter().filter_map(|id| self.data.get(id)).collect(),
+                    None           => self.data.values().collect(),
+                },
+            };
+            base.into_iter()
+                .filter(|doc| Self::eval_filter(doc, filter))
+                .map(|doc| Self::project(doc, &q.select))
+                .collect()
+        } else {
+            match collection_ids {
+                Some(ids) => ids.iter()
+                    .filter_map(|id| self.data.get(id))
+                    .map(|doc| Self::project(doc, &q.select))
+                    .collect(),
+                None => self.data.values()
+                    .map(|doc| Self::project(doc, &q.select))
+                    .collect(),
+            }
+        };
+
+        if !q.order.is_empty() {
+            results.sort_by(|a, b| {
+                for key in &q.order {
+                    let ord = Self::cmp_values(a.get(&key.field), b.get(&key.field));
+                    let ord = if key.dir == SortDir::Desc { ord.reverse() } else { ord };
+                    if ord != std::cmp::Ordering::Equal { return ord; }
+                }
+                std::cmp::Ordering::Equal
+            });
+        }
+
+        let start = q.offset.min(results.len());
+        let it = results.into_iter().skip(start);
+        match q.limit {
+            Some(n) => it.take(n).collect(),
+            None    => it.collect(),
+        }
+    }
+
+    fn index_hint(&self, filter: &Filter) -> Option<Vec<String>> {
+        match filter {
+            Filter::Cond(field, Predicate::Eq(val)) => {
+                self.index
+                    .get(field.as_str())
+                    .and_then(|m| m.get(&value_key(val)))
+                    .cloned()
+            }
+            Filter::And(children) => children.iter()
+                .filter_map(|c| self.index_hint(c))
+                .min_by_key(|ids| ids.len()),
+            _ => None,
+        }
+    }
+
+    fn eval_filter(doc: &Value, filter: &Filter) -> bool {
+        match filter {
+            Filter::Cond(field, pred) => doc.get(field).map(|v| Self::eval_pred(v, pred)).unwrap_or(false),
+            Filter::And(children)     => children.iter().all(|f| Self::eval_filter(doc, f)),
+            Filter::Or(children)      => children.iter().any(|f| Self::eval_filter(doc, f)),
+        }
+    }
+
+    fn eval_pred(val: &Value, pred: &Predicate) -> bool {
+        match pred {
+            Predicate::Eq(e)   => val == e,
+            Predicate::Gt(t)   => matches!((val.as_f64(), t.as_f64()), (Some(a), Some(b)) if a > b),
+            Predicate::Gte(t)  => matches!((val.as_f64(), t.as_f64()), (Some(a), Some(b)) if a >= b),
+            Predicate::Lt(t)   => matches!((val.as_f64(), t.as_f64()), (Some(a), Some(b)) if a < b),
+            Predicate::Lte(t)  => matches!((val.as_f64(), t.as_f64()), (Some(a), Some(b)) if a <= b),
+            Predicate::In(lst) => lst.contains(val),
+        }
+    }
+
+    fn cmp_values(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
+        match (a, b) {
+            (None, None)       => std::cmp::Ordering::Equal,
+            (None, _)          => std::cmp::Ordering::Greater,
+            (_, None)          => std::cmp::Ordering::Less,
+            (Some(x), Some(y)) => {
+                if let (Some(xf), Some(yf)) = (x.as_f64(), y.as_f64()) {
+                    xf.partial_cmp(&yf).unwrap_or(std::cmp::Ordering::Equal)
+                } else {
+                    x.to_string().cmp(&y.to_string())
+                }
             }
         }
     }
@@ -729,7 +741,7 @@ fn fnv1a(s: &str) -> u64 {
     let mut hash: u64 = 14695981039346656037;
     for byte in s.bytes() {
         hash ^= byte as u64;
-        hash = hash.wrapping_mul(1099511628211);
+        hash  = hash.wrapping_mul(1099511628211);
     }
     hash
 }

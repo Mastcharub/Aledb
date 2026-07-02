@@ -44,6 +44,7 @@ def register():
     print(f"{C.UNDERLINE}Conservalo{C.RESET}: ti servirà per accedere ai tuoi dati.")
 
 def insert():
+    collection = input(f"{C.BLUE}Collection (invio per nessuna) > {C.RESET} ").strip()
     raw = input(f"{C.BLUE}Inserisci documento JSON > {C.RESET} ")
     doc = _parse(raw)
     if doc is None:
@@ -51,12 +52,15 @@ def insert():
     if "tenant_id" not in doc:
         warn("tenant_id mancante. Usa 'register' per ottenerne uno.")
         return
+    if collection:
+        doc["_collection"] = collection
     info("Salvataggio in corso...")
     res = requests.post(f"{BASE_URL}/insert", json=doc).json()
     if _is_error(res):
         err(f"Errore salvataggio: {res['error']}")
         return
-    ok(f"Documento salvato. ID: {res['id']}")
+    coll_info = f" in '{res['collection']}'" if res.get("collection") else ""
+    ok(f"Documento salvato. ID: {res['id']}{coll_info}")
 
 def get():
     doc_id    = input(f"{C.BLUE}ID documento > {C.RESET} ")
@@ -125,16 +129,6 @@ def load():
     requests.post(f"{BASE_URL}/load", json={"path": path})
     ok(f"Dati caricati da {path}")
 
-# SQL parser
-#
-# Supports:
-#   SELECT * WHERE tenant_id = 'x' AND age > 18
-#   SELECT nome, age WHERE tenant_id = 'x' OR role = 'admin'
-#   SELECT * WHERE tenant_id = 'x' AND role IN ('admin', 'user')
-#   SELECT * WHERE tenant_id = 'x' ORDER BY age DESC
-#   SELECT * WHERE tenant_id = 'x' LIMIT 10
-#   SELECT * WHERE tenant_id = 'x' ORDER BY age DESC LIMIT 5 OFFSET 20
-
 def sql_to_json(sql: str) -> dict:
     sql = sql.strip().rstrip(";")
 
@@ -144,7 +138,6 @@ def sql_to_json(sql: str) -> dict:
         limit = int(m.group(1))
         sql = sql[:m.start()] + sql[m.end():]
 
-    # Estrai OFFSET
     offset = None
     m = re.search(r"\bOFFSET\s+(\d+)", sql, re.IGNORECASE)
     if m:
@@ -163,17 +156,21 @@ def sql_to_json(sql: str) -> dict:
                 order.append({"field": field, "dir": direction})
         sql = sql[:m.start()] + sql[m.end():]
 
-    m = re.match(r"SELECT\s+(.*?)\s*(?:WHERE\s+(.*))?$", sql.strip(), re.IGNORECASE | re.DOTALL)
+    m = re.match(r"SELECT\s+(.*?)\s*(?:FROM\s+(\w+))?\s*(?:WHERE\s+(.*))?$", sql.strip(), re.IGNORECASE | re.DOTALL)
     if not m:
-        raise ValueError("Sintassi SQL non valida. Esempio: SELECT * WHERE tenant_id = 'x'")
+        raise ValueError("Sintassi SQL non valida. Esempio: SELECT * FROM users WHERE tenant_id = 'x'")
 
     select_part = m.group(1).strip()
-    where_part  = (m.group(2) or "").strip()
+    from_part   = (m.group(2) or "").strip()
+    where_part  = (m.group(3) or "").strip()
 
     payload = {}
 
     if select_part != "*":
         payload["select"] = [f.strip() for f in select_part.split(",") if f.strip()]
+
+    if from_part:
+        payload["collection"] = from_part
 
     if where_part:
         payload["where"] = _parse_where(where_part)
@@ -186,7 +183,6 @@ def sql_to_json(sql: str) -> dict:
         payload["offset"] = offset
 
     return payload
-
 
 def _parse_value(raw: str):
     raw = raw.strip()
@@ -202,11 +198,9 @@ def _parse_value(raw: str):
         pass
     return raw
 
-
 def _parse_in_list(raw: str) -> list:
     raw = raw.strip().strip("()")
     return [_parse_value(v.strip()) for v in raw.split(",")]
-
 
 def _parse_condition(cond: str) -> dict:
     cond = cond.strip()
@@ -228,8 +222,8 @@ def _parse_condition(cond: str) -> dict:
 
     raise ValueError(f"Condizione non valida: '{cond}'")
 
-
 def _parse_where(where: str) -> dict:
+
     or_parts = re.split(r"\bOR\b", where, flags=re.IGNORECASE)
 
     if len(or_parts) > 1:
@@ -237,7 +231,6 @@ def _parse_where(where: str) -> dict:
         return {"$or": branches}
 
     return _parse_and_clause(where.strip())
-
 
 def _parse_and_clause(clause: str) -> dict:
     and_parts = re.split(r"\bAND\b", clause, flags=re.IGNORECASE)
@@ -249,6 +242,7 @@ def _parse_and_clause(clause: str) -> dict:
     and_list = []
     for part in and_parts:
         cond = _parse_condition(part.strip())
+
         for k in cond:
             if k in merged:
                 and_list = [_parse_condition(p.strip()) for p in and_parts]
@@ -277,6 +271,7 @@ def help_menu():
   {C.CYAN}update{C.RESET}     modifica documento
   {C.CYAN}delete{C.RESET}     elimina documento
   {C.CYAN}query{C.RESET}      cerca con SQL
+  {C.CYAN}migrate{C.RESET}    sposta un tenant su un nuovo shard
   {C.CYAN}save{C.RESET}       backup dati
   {C.CYAN}load{C.RESET}       ripristino backup
   {C.CYAN}help{C.RESET}       mostra menu

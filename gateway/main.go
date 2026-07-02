@@ -39,17 +39,30 @@ func initGateway() {
 		key = "tenant_id"
 	}
 	ring := buildRing(leaders)
-	g = Gateway{
-    	shardKey: key,
-    	leaders: leaders,
-    	ring: ring,
-    	tenants: make(map[string]bool),
-	}
-
+	g = Gateway{shardKey: key, leaders: leaders, ring: ring, tenants: make(map[string]bool)}
 	if err := loadTenants(); err != nil {
-    	fmt.Printf("[gateway] errore caricamento tenants: %v\n", err)
+		fmt.Printf("[gateway] errore caricamento tenants: %v\n", err)
 	}
 	fmt.Printf("[gateway] %d shard(s), key=%q\n", len(g.leaders), g.shardKey)
+}
+
+func loadTenants() error {
+	data, err := os.ReadFile(tenantsFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	g.tenantsMu.Lock()
+	defer g.tenantsMu.Unlock()
+	for _, line := range strings.Split(string(data), "\n") {
+		id := strings.TrimSpace(line)
+		if id != "" {
+			g.tenants[id] = true
+		}
+	}
+	return nil
 }
 
 const virtualNodes = 150
@@ -118,45 +131,23 @@ func extractKey(body []byte) string {
 	return ""
 }
 
-func loadTenants() error {
-	data, err := os.ReadFile(tenantsFile)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	lines := strings.Split(string(data), "\n")
-	g.tenantsMu.Lock()
-	defer g.tenantsMu.Unlock()
-
-	for _, line := range lines {
-		id := strings.TrimSpace(line)
-		if id != "" {
-			g.tenants[id] = true
-		}
-	}
-	return nil
-}
-
 func registerTenant(id string) error {
 	g.tenantsMu.Lock()
 	defer g.tenantsMu.Unlock()
-
 	if g.tenants[id] {
 		return nil
 	}
-
+	if err := os.MkdirAll("data", 0755); err != nil {
+		return err
+	}
 	f, err := os.OpenFile(tenantsFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-
 	if _, err := f.WriteString(id + "\n"); err != nil {
 		return err
 	}
-
 	g.tenants[id] = true
 	return nil
 }
@@ -407,6 +398,15 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]any{"gateway": "ok", "shards": shards})
 }
 
+func handleCollections(w http.ResponseWriter, r *http.Request) {
+	tenant := r.URL.Query().Get(g.shardKey)
+	if tenant == "" {
+		writeErr(w, fmt.Sprintf("parametro ?%s obbligatorio", g.shardKey))
+		return
+	}
+	proxyGet(w, leaderFor(tenant)+"/collections")
+}
+
 func handleShardFor(w http.ResponseWriter, r *http.Request) {
 	tenant := r.URL.Query().Get(g.shardKey)
 	if tenant == "" {
@@ -437,10 +437,9 @@ func handleTenantRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := registerTenant(id); err != nil {
-    	writeErr(w, err.Error())
-    	return
+		writeErr(w, err.Error())
+		return
 	}
-
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{g.shardKey: id})
 }
@@ -455,6 +454,7 @@ func main() {
 	}
 
 	http.HandleFunc("/insert",          handleInsert)
+	http.HandleFunc("/collections",     handleCollections)
 	http.HandleFunc("/get/",            handleGet)
 	http.HandleFunc("/update/",         handleUpdate)
 	http.HandleFunc("/delete/",         handleDelete)
