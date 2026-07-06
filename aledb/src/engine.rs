@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read, Write};
 use std::os::unix::io::AsRawFd;
@@ -14,7 +14,7 @@ pub enum Predicate {
     Gte(Value),
     Lt(Value),
     Lte(Value),
-    In(Vec<Value>),
+    In(Vec<Value>, HashSet<String>),
 }
 
 #[derive(Debug, Clone)]
@@ -25,7 +25,7 @@ pub enum Filter {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum SortDir {Asc, Desc}
+pub enum SortDir { Asc, Desc }
 
 #[derive(Debug, Clone)]
 pub struct SortKey {
@@ -117,7 +117,8 @@ impl Query {
                 "$lte" | "<=" | "lte" => Ok(Predicate::Lte(val.clone())),
                 "$in" => {
                     let items = val.as_array().ok_or("$in richiede un array")?.clone();
-                    Ok(Predicate::In(items))
+                    let keys: HashSet<String> = items.iter().map(value_key).collect();
+                    Ok(Predicate::In(items, keys))
                 }
                 other => Err(format!("Operatore non supportato: '{}'", other)),
             };
@@ -126,7 +127,7 @@ impl Query {
     }
 }
 
-type Index = HashMap<String, HashMap<String, Vec<String>>>;
+type Index = HashMap<String, HashMap<String, HashSet<String>>>;
 
 fn value_key(v: &Value) -> String {
     v.to_string()
@@ -208,8 +209,8 @@ impl Config {
 struct Snapshot {
     ts:          u64,
     data:        HashMap<String, Value>,
-    index:       HashMap<String, HashMap<String, Vec<String>>>,
-    collections: HashMap<String, Vec<String>>,
+    index:       HashMap<String, HashMap<String, HashSet<String>>>,
+    collections: HashMap<String, HashSet<String>>,
 }
 
 pub struct Aledb {
@@ -217,9 +218,11 @@ pub struct Aledb {
     data:             HashMap<String, Value>,
     index:            Index,
     modified_at:      HashMap<String, u64>,
-    collections:      HashMap<String, Vec<String>>,
+    modified_ts:      BTreeMap<u64, HashSet<String>>,
+    collections:      HashMap<String, HashSet<String>>,
     current_wal:      Option<File>,
     current_wal_path: Option<String>,
+    current_wal_size: u64,
     wal_paths:        Vec<String>,
     pending_fsync:    bool,
 }
@@ -231,9 +234,11 @@ impl Aledb {
             data:             HashMap::new(),
             index:            HashMap::new(),
             modified_at:      HashMap::new(),
+            modified_ts:      BTreeMap::new(),
             collections:      HashMap::new(),
             current_wal:      None,
             current_wal_path: None,
+            current_wal_size: 0,
             wal_paths:        Vec::new(),
             pending_fsync:    false,
         }
@@ -242,9 +247,14 @@ impl Aledb {
     pub fn autoload(&mut self) {
         fs::create_dir_all(&self.config.segment_dir).ok();
 
-        if let Some(snap_path) = self.latest_file("snap") {
-            match self.load_snapshot(&snap_path) {
-                Ok(_)  => println!("[DB] snapshot loaded from {}", snap_path),
+        let snap_path = self.latest_file("snap");
+        let snap_ts = snap_path.as_deref()
+            .and_then(|p| self.ts_from_path(p))
+            .unwrap_or(0);
+
+        if let Some(ref path) = snap_path {
+            match self.load_snapshot(path) {
+                Ok(_)  => println!("[DB] snapshot loaded from {}", path),
                 Err(e) => eprintln!("[DB] snapshot load failed: {}", e),
             }
         } else if let Some(path) = self.config.autoload_path.clone() {
@@ -255,10 +265,6 @@ impl Aledb {
                 }
             }
         }
-
-        let snap_ts = self.latest_file("snap")
-            .and_then(|p| self.ts_from_path(&p))
-            .unwrap_or(0);
 
         let wals = self.sorted_files_since("wal", snap_ts);
         self.wal_paths = wals.clone();
@@ -277,9 +283,13 @@ impl Aledb {
         self.data        = snap.data;
         self.index       = snap.index;
         self.collections = snap.collections;
-        for id in self.data.keys() {
-            self.modified_at.insert(id.clone(), snap.ts);
-        }
+        let ts = snap.ts;
+        let mut ts_set = HashSet::with_capacity(self.data.len());
+        self.modified_at = self.data.keys().map(|id| {
+            ts_set.insert(id.clone());
+            (id.clone(), ts)
+        }).collect();
+        self.modified_ts.insert(ts, ts_set);
         Ok(())
     }
 
@@ -304,9 +314,9 @@ impl Aledb {
                     if let Some(doc) = op.get("doc") {
                         let id = doc["id"].as_str().ok_or("missing id")?.to_string();
                         self.index_doc(&id, doc);
-                        self.modified_at.insert(id.clone(), now_ms());
+                        self.set_modified(&id, now_ms());
                         if let Some(coll) = op["collection"].as_str() {
-                            self.collections.entry(coll.to_string()).or_default().push(id.clone());
+                            self.collections.entry(coll.to_string()).or_default().insert(id.clone());
                         }
                         self.data.insert(id, doc.clone());
                     }
@@ -314,17 +324,14 @@ impl Aledb {
                 Some("patch") => {
                     if let (Some(id), Some(fields)) = (op["id"].as_str(), op.get("fields")) {
                         let id = id.to_string();
-                        if let Some(old) = self.data.get(&id).cloned() {
-                            self.deindex_doc(&id, &old);
-                        }
-                        if let Some(doc) = self.data.get_mut(&id) {
-                            if let (Value::Object(d), Value::Object(f)) = (doc, fields.clone()) {
+                        if let Some(mut doc) = self.data.remove(&id) {
+                            self.deindex_doc(&id, &doc);
+                            if let (Value::Object(d), Value::Object(f)) = (&mut doc, fields.clone()) {
                                 for (k, v) in f { d.insert(k, v); }
                             }
-                        }
-                        if let Some(updated) = self.data.get(&id).cloned() {
-                            self.index_doc(&id, &updated);
-                            self.modified_at.insert(id, now_ms());
+                            self.index_doc(&id, &doc);
+                            self.set_modified(&id, now_ms());
+                            self.data.insert(id, doc);
                         }
                     }
                 }
@@ -333,10 +340,10 @@ impl Aledb {
                         let id = id.to_string();
                         if let Some(doc) = self.data.remove(&id) {
                             self.deindex_doc(&id, &doc);
-                            self.modified_at.remove(&id);
+                            self.unset_modified(&id);
                         }
                         for ids in self.collections.values_mut() {
-                            ids.retain(|x| x != &id);
+                            ids.remove(&id);
                         }
                     }
                 }
@@ -353,6 +360,7 @@ impl Aledb {
             Ok(file) => {
                 self.current_wal      = Some(file);
                 self.current_wal_path = Some(path.clone());
+                self.current_wal_size = 0;
                 self.wal_paths.push(path);
             }
             Err(e) => eprintln!("[DB] failed to open WAL: {}", e),
@@ -366,6 +374,7 @@ impl Aledb {
         };
         let len = (payload.len() as u32).to_le_bytes();
 
+        let record_size = (4 + payload.len()) as u64;
         if let Some(file) = &mut self.current_wal {
             file.write_all(&len).ok();
             file.write_all(&payload).ok();
@@ -375,12 +384,8 @@ impl Aledb {
                 FsyncMode::Never    => {}
             }
         }
-
-        let too_big = self.current_wal_path.as_ref()
-            .and_then(|p| fs::metadata(p).ok())
-            .map(|m| m.len() > self.config.segment_max_mb * 1024 * 1024)
-            .unwrap_or(false);
-        if too_big {
+        self.current_wal_size += record_size;
+        if self.current_wal_size > self.config.segment_max_mb * 1024 * 1024 {
             self.rotate_wal();
         }
     }
@@ -398,9 +403,10 @@ impl Aledb {
 
         println!("[DB] compacting ({} WAL, {} MB)...", wal_count, wal_mb);
 
-        let snap_path = format!("{}/snap_{}.msgpack", self.config.segment_dir, now_ms());
+        let snap_ts   = now_ms();
+        let snap_path = format!("{}/snap_{}.msgpack", self.config.segment_dir, snap_ts);
         let snap = Snapshot {
-            ts:          now_ms(),
+            ts:          snap_ts,
             data:        self.data.clone(),
             index:       self.index.clone(),
             collections: self.collections.clone(),
@@ -411,7 +417,7 @@ impl Aledb {
         for p in self.sorted_files_since("snap", 0) {
             if p != snap_path { fs::remove_file(&p).ok(); }
         }
-        for p in self.wal_paths.drain(..).collect::<Vec<_>>() {
+        for p in self.wal_paths.drain(..) {
             fs::remove_file(&p).ok();
         }
 
@@ -438,13 +444,15 @@ impl Aledb {
         let mut pairs: Vec<(u64, String)> = entries
             .filter_map(|e| {
                 let path = e.ok()?.path();
-                let name = path.file_name()?.to_str()?.to_string();
+                let name = path.file_name()?.to_str()?;
                 if !name.starts_with(prefix) || path.extension()?.to_str()? != "msgpack" {
                     return None;
                 }
-                let stem   = path.file_stem()?.to_str()?.to_string();
-                let ts_str = stem.trim_start_matches(&format!("{}_", prefix));
-                let ts: u64 = ts_str.parse().ok()?;
+                let stem    = path.file_stem()?.to_str()?;
+                let ts_part = stem.strip_prefix(prefix)
+                    .and_then(|s| s.strip_prefix('_'))
+                    .unwrap_or(stem);
+                let ts: u64 = ts_part.parse().ok()?;
                 if ts > since_ts { Some((ts, path.to_string_lossy().to_string())) } else { None }
             })
             .collect();
@@ -477,10 +485,10 @@ impl Aledb {
         let id = Uuid::new_v4().to_string();
         doc["id"] = Value::String(id.clone());
         self.index_doc(&id, &doc);
-        self.modified_at.insert(id.clone(), now_ms());
+        self.set_modified(&id, now_ms());
         let wal_record = match collection {
             Some(c) => {
-                self.collections.entry(c.to_string()).or_default().push(id.clone());
+                self.collections.entry(c.to_string()).or_default().insert(id.clone());
                 serde_json::json!({ "op": "insert", "collection": c, "doc": &doc })
             }
             None => serde_json::json!({ "op": "insert", "doc": &doc }),
@@ -497,17 +505,17 @@ impl Aledb {
     pub fn delete(&mut self, id: &str) {
         if let Some(doc) = self.data.remove(id) {
             self.deindex_doc(id, &doc);
-            self.modified_at.remove(id);
-            for ids in self.collections.values_mut() {
-                ids.retain(|x| x != id);
+            self.unset_modified(id);
+            for set in self.collections.values_mut() {
+                set.remove(id);
             }
             self.write_wal_record(&serde_json::json!({ "op": "delete", "id": id }));
         }
     }
 
     pub fn update(&mut self, id: &str, patch: Value) {
-        if let Some(old_doc) = self.data.get(id).cloned() {
-            self.deindex_doc(id, &old_doc);
+        if let Some(old_doc) = self.data.get(id) {
+            self.deindex_doc(id, old_doc);
         }
         self.write_wal_record(&serde_json::json!({ "op": "patch", "id": id, "fields": &patch }));
         if let Some(existing) = self.data.get_mut(id) {
@@ -515,9 +523,9 @@ impl Aledb {
                 for (k, v) in p { e.insert(k, v); }
             }
         }
-        if let Some(updated_doc) = self.data.get(id).cloned() {
-            self.index_doc(id, &updated_doc);
-            self.modified_at.insert(id.to_string(), now_ms());
+        if let Some(updated_doc) = self.data.get(id) {
+            self.index_doc(id, updated_doc);
+            self.set_modified(id, now_ms());
         }
     }
 
@@ -534,17 +542,18 @@ impl Aledb {
         for doc in docs {
             let id = doc["id"].as_str().ok_or("Missing id")?.to_string();
             self.index_doc(&id, &doc);
-            self.modified_at.insert(id.clone(), now_ms());
+            self.set_modified(&id, now_ms());
             self.data.insert(id, doc);
         }
         Ok(())
     }
 
     pub fn docs_since(&self, since_ms: u64) -> Vec<Value> {
-        self.modified_at
-            .iter()
-            .filter(|(_, &ts)| ts > since_ms)
-            .filter_map(|(id, _)| self.data.get(id).cloned())
+        use std::ops::Bound;
+        self.modified_ts
+            .range((Bound::Excluded(since_ms), Bound::Unbounded))
+            .flat_map(|(_, ids)| ids.iter())
+            .filter_map(|id| self.data.get(id).cloned())
             .collect()
     }
 
@@ -554,11 +563,11 @@ impl Aledb {
                 Some(id) => id.to_string(),
                 None     => continue,
             };
-            if let Some(old) = self.data.get(&id).cloned() {
+            if let Some(old) = self.data.remove(&id) {
                 self.deindex_doc(&id, &old);
             }
             self.index_doc(&id, &doc);
-            self.modified_at.insert(id.clone(), leader_ts);
+            self.set_modified(&id, leader_ts);
             self.data.insert(id, doc);
         }
     }
@@ -571,23 +580,27 @@ impl Aledb {
     }
 
     pub fn docs_for_tenant(&self, shard_key: &str, tenant_id: &str) -> Vec<Value> {
-        self.data.values()
-            .filter(|doc| doc.get(shard_key).and_then(|v| v.as_str()) == Some(tenant_id))
-            .cloned()
-            .collect()
+        let key = value_key(&serde_json::Value::String(tenant_id.to_string()));
+        self.index
+            .get(shard_key)
+            .and_then(|m| m.get(&key))
+            .map(|ids| ids.iter().filter_map(|id| self.data.get(id).cloned()).collect())
+            .unwrap_or_default()
     }
 
     pub fn delete_tenant(&mut self, shard_key: &str, tenant_id: &str) {
-        let ids: Vec<String> = self.data.iter()
-            .filter(|(_, doc)| doc.get(shard_key).and_then(|v| v.as_str()) == Some(tenant_id))
-            .map(|(id, _)| id.clone())
-            .collect();
+        let key   = value_key(&serde_json::Value::String(tenant_id.to_string()));
+        let ids: Vec<String> = self.index
+            .get(shard_key)
+            .and_then(|m| m.get(&key))
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default();
         for id in ids {
             if let Some(doc) = self.data.remove(&id) {
                 self.deindex_doc(&id, &doc);
-                self.modified_at.remove(&id);
-                for ids in self.collections.values_mut() {
-                    ids.retain(|x| x != &id);
+                self.unset_modified(&id);
+                for set in self.collections.values_mut() {
+                    set.remove(&id);
                 }
                 self.write_wal_record(&serde_json::json!({ "op": "delete", "id": &id }));
             }
@@ -595,7 +608,7 @@ impl Aledb {
     }
 
     pub fn query(&self, q: &Query) -> Vec<Value> {
-        let collection_ids: Option<&Vec<String>> = q.collection
+        let collection_ids: Option<&HashSet<String>> = q.collection
             .as_deref()
             .and_then(|c| self.collections.get(c));
 
@@ -648,11 +661,30 @@ impl Aledb {
                 self.index
                     .get(field.as_str())
                     .and_then(|m| m.get(&value_key(val)))
-                    .cloned()
+                    .map(|s| s.iter().cloned().collect())
             }
-            Filter::And(children) => children.iter()
-                .filter_map(|c| self.index_hint(c))
-                .min_by_key(|ids| ids.len()),
+            Filter::And(children) => {
+                let sets: Vec<HashSet<&str>> = children.iter()
+                    .filter_map(|c| match c {
+                        Filter::Cond(field, Predicate::Eq(val)) => {
+                            self.index
+                                .get(field.as_str())
+                                .and_then(|m| m.get(&value_key(val)))
+                                .map(|s| s.iter().map(|id| id.as_str()).collect::<HashSet<_>>())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if sets.is_empty() {
+                    return None;
+                }
+                let smallest = sets.iter().min_by_key(|s| s.len())?;
+                let result: Vec<String> = smallest.iter()
+                    .filter(|id| sets.iter().all(|s| s.contains(*id)))
+                    .map(|s| s.to_string())
+                    .collect();
+                Some(result)
+            }
             _ => None,
         }
     }
@@ -672,7 +704,7 @@ impl Aledb {
             Predicate::Gte(t)  => matches!((val.as_f64(), t.as_f64()), (Some(a), Some(b)) if a >= b),
             Predicate::Lt(t)   => matches!((val.as_f64(), t.as_f64()), (Some(a), Some(b)) if a < b),
             Predicate::Lte(t)  => matches!((val.as_f64(), t.as_f64()), (Some(a), Some(b)) if a <= b),
-            Predicate::In(lst) => lst.contains(val),
+            Predicate::In(_, keys) => keys.contains(&value_key(val)),
         }
     }
 
@@ -684,6 +716,8 @@ impl Aledb {
             (Some(x), Some(y)) => {
                 if let (Some(xf), Some(yf)) = (x.as_f64(), y.as_f64()) {
                     xf.partial_cmp(&yf).unwrap_or(std::cmp::Ordering::Equal)
+                } else if let (Some(xs), Some(ys)) = (x.as_str(), y.as_str()) {
+                    xs.cmp(ys)
                 } else {
                     x.to_string().cmp(&y.to_string())
                 }
@@ -691,25 +725,52 @@ impl Aledb {
         }
     }
 
-    fn index_doc(&mut self, id: &str, doc: &Value) {
-        if let Some(obj) = doc.as_object() {
-            for (field, val) in obj {
-                self.index
-                    .entry(field.clone())
-                    .or_default()
-                    .entry(value_key(val))
-                    .or_default()
-                    .push(id.to_string());
+    fn set_modified(&mut self, id: &str, ts: u64) {
+        if let Some(old_ts) = self.modified_at.get(id).copied() {
+            if let Some(set) = self.modified_ts.get_mut(&old_ts) {
+                set.remove(id);
+                if set.is_empty() {
+                    self.modified_ts.remove(&old_ts);
+                }
+            }
+        }
+        self.modified_at.insert(id.to_string(), ts);
+        self.modified_ts.entry(ts).or_default().insert(id.to_string());
+    }
+
+    fn unset_modified(&mut self, id: &str) {
+        if let Some(ts) = self.modified_at.remove(id) {
+            if let Some(set) = self.modified_ts.get_mut(&ts) {
+                set.remove(id);
+                if set.is_empty() {
+                    self.modified_ts.remove(&ts);
+                }
             }
         }
     }
 
+    fn index_doc(&mut self, id: &str, doc: &Value) {
+        let Some(obj) = doc.as_object() else { return };
+        let id_owned = id.to_string();
+        for (field, val) in obj {
+            self.index
+                .entry(field.clone())
+                .or_default()
+                .entry(value_key(val))
+                .or_default()
+                .insert(id_owned.clone());
+        }
+    }
+
     fn deindex_doc(&mut self, id: &str, doc: &Value) {
-        if let Some(obj) = doc.as_object() {
-            for (field, val) in obj {
-                if let Some(field_map) = self.index.get_mut(field) {
-                    if let Some(ids) = field_map.get_mut(&value_key(val)) {
-                        ids.retain(|x| x != id);
+        let Some(obj) = doc.as_object() else { return };
+        for (field, val) in obj {
+            let key = value_key(val);
+            if let Some(field_map) = self.index.get_mut(field) {
+                if let Some(ids) = field_map.get_mut(&key) {
+                    ids.remove(id);
+                    if ids.is_empty() {
+                        field_map.remove(&key);
                     }
                 }
             }
@@ -720,7 +781,7 @@ impl Aledb {
         match select {
             None => doc.clone(),
             Some(fields) => {
-                let mut out = serde_json::Map::new();
+                let mut out = serde_json::Map::with_capacity(fields.len());
                 for field in fields {
                     if let Some(v) = doc.get(field) {
                         out.insert(field.clone(), v.clone());
