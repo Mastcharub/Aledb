@@ -514,18 +514,24 @@ impl Aledb {
     }
 
     pub fn update(&mut self, id: &str, patch: Value) {
-        if let Some(old_doc) = self.data.get(id) {
-            self.deindex_doc(id, old_doc);
-        }
-        self.write_wal_record(&serde_json::json!({ "op": "patch", "id": id, "fields": &patch }));
-        if let Some(existing) = self.data.get_mut(id) {
-            if let (Value::Object(e), Value::Object(p)) = (existing, patch) {
-                for (k, v) in p { e.insert(k, v); }
+        self.write_wal_record(&serde_json::json!({
+            "op": "patch",
+            "id": id,
+            "fields": &patch
+        }));
+
+        if let Some(mut doc) = self.data.remove(id) {
+            self.deindex_doc(id, &doc);
+
+            if let (Value::Object(d), Value::Object(p)) = (&mut doc, patch) {
+                for (k, v) in p {
+                    d.insert(k, v);
+                }
             }
-        }
-        if let Some(updated_doc) = self.data.get(id) {
-            self.index_doc(id, updated_doc);
+
+            self.index_doc(id, &doc);
             self.set_modified(id, now_ms());
+            self.data.insert(id.to_string(), doc);
         }
     }
 
