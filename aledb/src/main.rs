@@ -13,7 +13,7 @@ use std::{
     sync::{Arc, RwLock},
     time::Duration,
 };
-use tokio::time;
+use tokio::{signal, time};
 
 #[derive(Clone)]
 struct AppState {
@@ -52,25 +52,52 @@ async fn main() {
     }
 
     let app = Router::new()
-        .route("/insert",         post(insert))
-        .route("/get/{id}",       get(get_doc))
-        .route("/update/{id}",    post(update_doc))
-        .route("/delete/{id}",    delete(delete_doc))
-        .route("/query",          post(query))
-        .route("/save",           post(save))
-        .route("/load",           post(load))
-        .route("/sync",           get(sync_endpoint))
-        .route("/migrate/export", post(migrate_export))
-        .route("/migrate/import", post(migrate_import))
-        .route("/collections",    get(list_collections))
-        .route("/health",         get(health))
-        .with_state(state);
+        .route("/insert",             post(insert))
+        .route("/get/{id}",           get(get_doc))
+        .route("/update/{id}",        post(update_doc))
+        .route("/delete/{id}",        delete(delete_doc))
+        .route("/query",              post(query))
+        .route("/save",               post(save))
+        .route("/load",               post(load))
+        .route("/sync",               get(sync_endpoint))
+        .route("/migrate/export",     post(migrate_export))
+        .route("/migrate/import",     post(migrate_import))
+        .route("/collections",        get(list_collections))
+        .route("/health",             get(health))
+        .with_state(state.clone());
 
     let addr = format!("0.0.0.0:{}", config.port);
     println!("[{}] listening on {}", config.role.to_uppercase(), addr);
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(state.db))
+        .await
+        .unwrap();
+}
+
+async fn shutdown_signal(db: Arc<RwLock<Aledb>>) {
+    let ctrl_c = async {
+        signal::ctrl_c().await.expect("failed to install Ctrl+C handler");
+    };
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    tokio::select! {
+        _ = ctrl_c    => {},
+        _ = terminate => {},
+    }
+    println!("[shutdown] signal received, flushing WAL...");
+    let mut db = db.write().unwrap();
+    db.flush_fsync();
+    if let Err(e) = db.compact() {
+        eprintln!("[shutdown] compact error: {}", e);
+    }
+    println!("[shutdown] done");
 }
 
 async fn compact_loop(db: Arc<RwLock<Aledb>>) {
@@ -94,19 +121,22 @@ async fn fsync_loop(db: Arc<RwLock<Aledb>>, interval_ms: u64) {
 }
 
 async fn sync_loop(db: Arc<RwLock<Aledb>>, leader_url: String, interval_secs: u64) {
-    let client   = Client::new();
-    let mut last = 0u64;
-
-    let mut ticker = time::interval(Duration::from_secs(interval_secs));
-    ticker.tick().await;
+    let client      = Client::new();
+    let mut last    = 0u64;
+    let mut backoff = interval_secs;
+    let max_backoff = interval_secs * 32;
 
     loop {
-        ticker.tick().await;
+        time::sleep(Duration::from_secs(backoff)).await;
 
         let url  = format!("{}/sync?since={}", leader_url, last);
         let resp = match client.get(&url).send().await {
-            Ok(r)  => r,
-            Err(e) => { eprintln!("[FOLLOWER] sync error: {}", e); continue; }
+            Ok(r)  => { backoff = interval_secs; r }
+            Err(e) => {
+                eprintln!("[FOLLOWER] sync error: {} (retry in {}s)", e, backoff);
+                backoff = (backoff * 2).min(max_backoff);
+                continue;
+            }
         };
         let body: Value = match resp.json().await {
             Ok(v)  => v,

@@ -324,21 +324,39 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 	io.Copy(w, resp.Body)
 }
 
+func extractShardKey(v any) (string, bool) {
+	switch node := v.(type) {
+	case map[string]any:
+		if val, ok := node[g.shardKey]; ok {
+			s := fmt.Sprint(val)
+			if s != "" && s != "<nil>" {
+				return s, true
+			}
+		}
+		for _, k := range []string{"$and", "$or"} {
+			if children, ok := node[k].([]any); ok {
+				for _, child := range children {
+					if found, ok := extractShardKey(child); ok {
+						return found, true
+					}
+				}
+			}
+		}
+	}
+	return "", false
+}
+
 func handleQuery(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 	var payload map[string]any
 	json.Unmarshal(body, &payload)
-	where, ok := payload["where"].(map[string]any)
-	if !ok {
-		writeErr(w, fmt.Sprintf("'where.%s' obbligatorio", g.shardKey))
+
+	tenantVal, found := extractShardKey(payload["where"])
+	if !found {
+		writeErr(w, fmt.Sprintf("'where.%s' obbligatorio (anche dentro $and/$or)", g.shardKey))
 		return
 	}
-	val, ok := where[g.shardKey]
-	if !ok {
-		writeErr(w, fmt.Sprintf("'where.%s' obbligatorio", g.shardKey))
-		return
-	}
-	if err := proxyPost(w, leaderFor(fmt.Sprint(val))+"/query", body); err != nil {
+	if err := proxyPost(w, leaderFor(tenantVal)+"/query", body); err != nil {
 		writeErr(w, err.Error())
 	}
 }
