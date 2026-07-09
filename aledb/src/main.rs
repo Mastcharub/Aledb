@@ -159,10 +159,7 @@ async fn sync_loop(db: Arc<RwLock<Aledb>>, leader_url: String, interval_secs: u6
 #[derive(Deserialize)]
 struct SinceParams { since: Option<u64> }
 
-async fn sync_endpoint(
-    State(state): State<AppState>,
-    AxumQuery(params): AxumQuery<SinceParams>,
-) -> Json<Value> {
+async fn sync_endpoint(State(state): State<AppState>, AxumQuery(params): AxumQuery<SinceParams>) -> Json<Value> {
     let since = params.since.unwrap_or(0);
     let db    = state.db.read().unwrap();
     let docs  = db.docs_since(since);
@@ -181,10 +178,7 @@ struct ExportParams {
     delete: bool,
 }
 
-async fn migrate_export(
-    State(state): State<AppState>,
-    Json(params): Json<Value>,
-) -> Json<Value> {
+async fn migrate_export(State(state): State<AppState>, Json(params): Json<Value>) -> Json<Value> {
     let shard_key = match params["shard_key"].as_str() {
         Some(k) => k.to_string(),
         None    => return Json(json!({ "error": "shard_key mancante" })),
@@ -204,10 +198,7 @@ async fn migrate_export(
     Json(json!({ "count": docs.len(), "docs": docs }))
 }
 
-async fn migrate_import(
-    State(state): State<AppState>,
-    Json(payload): Json<Value>,
-) -> Json<Value> {
+async fn migrate_import(State(state): State<AppState>, Json(payload): Json<Value>) -> Json<Value> {
     let docs = match payload["docs"].as_array() {
         Some(d) => d.clone(),
         None    => return Json(json!({ "error": "docs mancante" })),
@@ -247,11 +238,7 @@ async fn get_doc(State(state): State<AppState>, Path(id): Path<String>) -> Json<
     }
 }
 
-async fn update_doc(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(patch): Json<Value>,
-) -> Json<Value> {
+async fn update_doc(State(state): State<AppState>, Path(id): Path<String>, Json(patch): Json<Value>) -> Json<Value> {
     let mut db = state.db.write().unwrap();
     if db.config.role == "follower" {
         return Json(json!({ "error": "follower in sola lettura" }));
@@ -260,10 +247,7 @@ async fn update_doc(
     Json(json!({ "status": "ok" }))
 }
 
-async fn delete_doc(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Json<Value> {
+async fn delete_doc(State(state): State<AppState>, Path(id): Path<String>) -> Json<Value> {
     let mut db = state.db.write().unwrap();
     if db.config.role == "follower" {
         return Json(json!({ "error": "follower in sola lettura" }));

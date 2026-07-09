@@ -205,13 +205,17 @@ impl Config {
     }
 }
 
+// Snapshot senza indice — viene ricostruito all'avvio da zero
+// Formato su disco: snap_<ts>.zst  (msgpack compresso con zstd)
 #[derive(Serialize, Deserialize)]
 struct Snapshot {
     ts:          u64,
     data:        HashMap<String, Value>,
-    index:       HashMap<String, HashMap<String, HashSet<String>>>,
     collections: HashMap<String, HashSet<String>>,
 }
+
+const SNAP_EXT: &str = "zst";
+const WAL_EXT:  &str = "msgpack";
 
 pub struct Aledb {
     pub config:       Config,
@@ -247,9 +251,9 @@ impl Aledb {
     pub fn autoload(&mut self) {
         fs::create_dir_all(&self.config.segment_dir).ok();
 
-        let snap_path = self.latest_file("snap");
-        let snap_ts = snap_path.as_deref()
-            .and_then(|p| self.ts_from_path(p))
+        let snap_path = self.latest_snap();
+        let snap_ts   = snap_path.as_deref()
+            .and_then(|p| self.ts_from_snap_path(p))
             .unwrap_or(0);
 
         if let Some(ref path) = snap_path {
@@ -266,7 +270,7 @@ impl Aledb {
             }
         }
 
-        let wals = self.sorted_files_since("wal", snap_ts);
+        let wals = self.sorted_wals_since(snap_ts);
         self.wal_paths = wals.clone();
         for path in &wals {
             if let Err(e) = self.replay_wal(path) {
@@ -277,12 +281,80 @@ impl Aledb {
         self.rotate_wal();
     }
 
+    // snap_<ts>.zst
+    fn snap_path(&self, ts: u64) -> String {
+        format!("{}/snap_{}.{}", self.config.segment_dir, ts, SNAP_EXT)
+    }
+
+    // wal_<ts>.msgpack
+    fn wal_path(&self, ts: u64) -> String {
+        format!("{}/wal_{}.{}", self.config.segment_dir, ts, WAL_EXT)
+    }
+
+    fn latest_snap(&self) -> Option<String> {
+        self.sorted_snaps_since(0).into_iter().last()
+    }
+
+    // Elenca snap_*.zst ordinati per timestamp
+    fn sorted_snaps_since(&self, since_ts: u64) -> Vec<String> {
+        self.list_files_with("snap_", SNAP_EXT, since_ts)
+    }
+
+    // Elenca wal_*.msgpack ordinati per timestamp
+    fn sorted_wals_since(&self, since_ts: u64) -> Vec<String> {
+        self.list_files_with("wal_", WAL_EXT, since_ts)
+    }
+
+    fn list_files_with(&self, prefix: &str, ext: &str, since_ts: u64) -> Vec<String> {
+        let Ok(entries) = fs::read_dir(&self.config.segment_dir) else { return vec![]; };
+        let mut pairs: Vec<(u64, String)> = entries
+            .filter_map(|e| {
+                let path = e.ok()?.path();
+                let name = path.file_name()?.to_str()?;
+                if !name.starts_with(prefix) { return None; }
+                if path.extension()?.to_str()? != ext { return None; }
+                // nome: snap_<ts>.zst → strip prefix "snap_", strip suffix ".<ext>"
+                let ts_str = name
+                    .strip_prefix(prefix)?
+                    .strip_suffix(&format!(".{}", ext))?;
+                let ts: u64 = ts_str.parse().ok()?;
+                if ts > since_ts {
+                    Some((ts, path.to_string_lossy().to_string()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        pairs.sort_by_key(|(ts, _)| *ts);
+        pairs.into_iter().map(|(_, p)| p).collect()
+    }
+
+    // Estrae il timestamp da snap_<ts>.zst
+    fn ts_from_snap_path(&self, path: &str) -> Option<u64> {
+        let name = std::path::Path::new(path).file_name()?.to_str()?;
+        name.strip_prefix("snap_")?.strip_suffix(&format!(".{}", SNAP_EXT))?.parse().ok()
+    }
+
     fn load_snapshot(&mut self, path: &str) -> Result<(), String> {
-        let bytes = fs::read(path).map_err(|e| e.to_string())?;
-        let snap: Snapshot = rmp_serde::from_slice(&bytes).map_err(|e| e.to_string())?;
+        let compressed = fs::read(path).map_err(|e| e.to_string())?;
+        let bytes = zstd::decode_all(&compressed[..])
+            .map_err(|e| format!("zstd decode: {}", e))?;
+        let snap: Snapshot = rmp_serde::from_slice(&bytes)
+            .map_err(|e| e.to_string())?;
+
         self.data        = snap.data;
-        self.index       = snap.index;
         self.collections = snap.collections;
+
+        // Ricostruisce l'indice da zero — non è salvato nello snapshot
+        self.index.clear();
+        let ids_and_docs: Vec<(String, Value)> = self.data
+            .iter()
+            .map(|(id, doc)| (id.clone(), doc.clone()))
+            .collect();
+        for (id, doc) in ids_and_docs {
+            self.index_doc(&id, &doc);
+        }
+
         let ts = snap.ts;
         let mut ts_set = HashSet::with_capacity(self.data.len());
         self.modified_at = self.data.keys().map(|id| {
@@ -355,7 +427,7 @@ impl Aledb {
     }
 
     fn rotate_wal(&mut self) {
-        let path = format!("{}/wal_{}.msgpack", self.config.segment_dir, now_ms());
+        let path = self.wal_path(now_ms());
         match OpenOptions::new().create(true).append(true).open(&path) {
             Ok(file) => {
                 self.current_wal      = Some(file);
@@ -372,9 +444,9 @@ impl Aledb {
             Ok(p)  => p,
             Err(_) => return,
         };
-        let len = (payload.len() as u32).to_le_bytes();
-
+        let len         = (payload.len() as u32).to_le_bytes();
         let record_size = (4 + payload.len()) as u64;
+
         if let Some(file) = &mut self.current_wal {
             file.write_all(&len).ok();
             file.write_all(&payload).ok();
@@ -404,17 +476,19 @@ impl Aledb {
         println!("[DB] compacting ({} WAL, {} MB)...", wal_count, wal_mb);
 
         let snap_ts   = now_ms();
-        let snap_path = format!("{}/snap_{}.msgpack", self.config.segment_dir, snap_ts);
-        let snap = Snapshot {
+        let snap_path = self.snap_path(snap_ts);
+        let snap      = Snapshot {
             ts:          snap_ts,
             data:        self.data.clone(),
-            index:       self.index.clone(),
             collections: self.collections.clone(),
         };
-        let bytes = rmp_serde::to_vec(&snap).map_err(|e| e.to_string())?;
-        fs::write(&snap_path, bytes).map_err(|e| e.to_string())?;
 
-        for p in self.sorted_files_since("snap", 0) {
+        let msgpack    = rmp_serde::to_vec(&snap).map_err(|e| e.to_string())?;
+        let compressed = zstd::encode_all(&msgpack[..], 3)
+            .map_err(|e| format!("zstd encode: {}", e))?;
+        fs::write(&snap_path, compressed).map_err(|e| e.to_string())?;
+
+        for p in self.sorted_snaps_since(0) {
             if p != snap_path { fs::remove_file(&p).ok(); }
         }
         for p in self.wal_paths.drain(..) {
@@ -433,36 +507,6 @@ impl Aledb {
             }
             self.pending_fsync = false;
         }
-    }
-
-    fn latest_file(&self, prefix: &str) -> Option<String> {
-        self.sorted_files_since(prefix, 0).into_iter().last()
-    }
-
-    fn sorted_files_since(&self, prefix: &str, since_ts: u64) -> Vec<String> {
-        let Ok(entries) = fs::read_dir(&self.config.segment_dir) else { return vec![]; };
-        let mut pairs: Vec<(u64, String)> = entries
-            .filter_map(|e| {
-                let path = e.ok()?.path();
-                let name = path.file_name()?.to_str()?;
-                if !name.starts_with(prefix) || path.extension()?.to_str()? != "msgpack" {
-                    return None;
-                }
-                let stem    = path.file_stem()?.to_str()?;
-                let ts_part = stem.strip_prefix(prefix)
-                    .and_then(|s| s.strip_prefix('_'))
-                    .unwrap_or(stem);
-                let ts: u64 = ts_part.parse().ok()?;
-                if ts > since_ts { Some((ts, path.to_string_lossy().to_string())) } else { None }
-            })
-            .collect();
-        pairs.sort_by_key(|(ts, _)| *ts);
-        pairs.into_iter().map(|(_, p)| p).collect()
-    }
-
-    fn ts_from_path(&self, path: &str) -> Option<u64> {
-        let stem = std::path::Path::new(path).file_stem()?.to_str()?.to_string();
-        stem.rsplit('_').next()?.parse().ok()
     }
 
     pub fn owns_doc(&self, doc: &Value) -> bool {
@@ -519,16 +563,11 @@ impl Aledb {
             "id": id,
             "fields": &patch
         }));
-
         if let Some(mut doc) = self.data.remove(id) {
             self.deindex_doc(id, &doc);
-
             if let (Value::Object(d), Value::Object(p)) = (&mut doc, patch) {
-                for (k, v) in p {
-                    d.insert(k, v);
-                }
+                for (k, v) in p { d.insert(k, v); }
             }
-
             self.index_doc(id, &doc);
             self.set_modified(id, now_ms());
             self.data.insert(id.to_string(), doc);
@@ -586,7 +625,7 @@ impl Aledb {
     }
 
     pub fn docs_for_tenant(&self, shard_key: &str, tenant_id: &str) -> Vec<Value> {
-        let key = value_key(&serde_json::Value::String(tenant_id.to_string()));
+        let key = value_key(&Value::String(tenant_id.to_string()));
         self.index
             .get(shard_key)
             .and_then(|m| m.get(&key))
@@ -595,7 +634,7 @@ impl Aledb {
     }
 
     pub fn delete_tenant(&mut self, shard_key: &str, tenant_id: &str) {
-        let key   = value_key(&serde_json::Value::String(tenant_id.to_string()));
+        let key = value_key(&Value::String(tenant_id.to_string()));
         let ids: Vec<String> = self.index
             .get(shard_key)
             .and_then(|m| m.get(&key))
@@ -654,7 +693,7 @@ impl Aledb {
         }
 
         let start = q.offset.min(results.len());
-        let it = results.into_iter().skip(start);
+        let it    = results.into_iter().skip(start);
         match q.limit {
             Some(n) => it.take(n).collect(),
             None    => it.collect(),
@@ -681,9 +720,7 @@ impl Aledb {
                         _ => None,
                     })
                     .collect();
-                if sets.is_empty() {
-                    return None;
-                }
+                if sets.is_empty() { return None; }
                 let smallest = sets.iter().min_by_key(|s| s.len())?;
                 let result: Vec<String> = smallest.iter()
                     .filter(|id| sets.iter().all(|s| s.contains(*id)))
@@ -705,11 +742,11 @@ impl Aledb {
 
     fn eval_pred(val: &Value, pred: &Predicate) -> bool {
         match pred {
-            Predicate::Eq(e)   => val == e,
-            Predicate::Gt(t)   => matches!((val.as_f64(), t.as_f64()), (Some(a), Some(b)) if a > b),
-            Predicate::Gte(t)  => matches!((val.as_f64(), t.as_f64()), (Some(a), Some(b)) if a >= b),
-            Predicate::Lt(t)   => matches!((val.as_f64(), t.as_f64()), (Some(a), Some(b)) if a < b),
-            Predicate::Lte(t)  => matches!((val.as_f64(), t.as_f64()), (Some(a), Some(b)) if a <= b),
+            Predicate::Eq(e)       => val == e,
+            Predicate::Gt(t)       => matches!((val.as_f64(), t.as_f64()), (Some(a), Some(b)) if a > b),
+            Predicate::Gte(t)      => matches!((val.as_f64(), t.as_f64()), (Some(a), Some(b)) if a >= b),
+            Predicate::Lt(t)       => matches!((val.as_f64(), t.as_f64()), (Some(a), Some(b)) if a < b),
+            Predicate::Lte(t)      => matches!((val.as_f64(), t.as_f64()), (Some(a), Some(b)) if a <= b),
             Predicate::In(_, keys) => keys.contains(&value_key(val)),
         }
     }
@@ -757,7 +794,7 @@ impl Aledb {
 
     fn index_doc(&mut self, id: &str, doc: &Value) {
         let Some(obj) = doc.as_object() else { return };
-        let id_owned = id.to_string();
+        let id_owned  = id.to_string();
         for (field, val) in obj {
             self.index
                 .entry(field.clone())
