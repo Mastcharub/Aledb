@@ -1,5 +1,5 @@
 aledb/target
-aledbdb/Cargo.lock
+aledb/Cargo.lock
 /doc.json
 /aledb/segments
 /scriptie.py
